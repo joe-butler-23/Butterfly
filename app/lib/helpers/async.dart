@@ -99,10 +99,11 @@ class CoalescedAsyncRunner {
 /// is the only source of scheduling; no duration is used to approximate a
 /// display frame.
 class FrameCoalescedAsyncRunner {
-  FrameCoalescedAsyncRunner({SchedulerBinding? binding})
-    : _binding = binding ?? SchedulerBinding.instance;
+  FrameCoalescedAsyncRunner({this.binding});
 
-  final SchedulerBinding _binding;
+  /// Resolved lazily so constructing a runner never requires a binding.
+  final SchedulerBinding? binding;
+  SchedulerBinding get _scheduler => binding ?? SchedulerBinding.instance;
   _FrameRequest? _pending;
   int? _frameCallbackId;
   Future<void>? _running;
@@ -126,7 +127,7 @@ class FrameCoalescedAsyncRunner {
 
   void _scheduleFrame() {
     if (_disposed || _frameCallbackId != null) return;
-    _frameCallbackId = _binding.scheduleFrameCallback(_onFrame);
+    _frameCallbackId = _scheduler.scheduleFrameCallback(_onFrame);
   }
 
   void _onFrame(Duration _) {
@@ -179,7 +180,7 @@ class FrameCoalescedAsyncRunner {
   void cancel() {
     final callbackId = _frameCallbackId;
     if (callbackId != null) {
-      _binding.cancelFrameCallbackWithId(callbackId);
+      _scheduler.cancelFrameCallbackWithId(callbackId);
       _frameCallbackId = null;
     }
     final request = _pending;
