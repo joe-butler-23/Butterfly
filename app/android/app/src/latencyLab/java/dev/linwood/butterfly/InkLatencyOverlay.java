@@ -9,6 +9,7 @@ import android.view.View;
 import android.view.ViewGroup;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.ink.authoring.InProgressStrokeId;
 import androidx.ink.authoring.InProgressStrokesFinishedListener;
 import androidx.ink.authoring.InProgressStrokesView;
@@ -39,6 +40,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     private boolean configured;
     private boolean enabled;
     private boolean failed;
+    @Nullable private FailureCallback failureCallback;
     private boolean eagerInitRequested;
 
     InkLatencyOverlay(Context context, View flutterInputView, boolean predictionArm) {
@@ -64,6 +66,10 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     }
 
     @Override public View getView() { return view; }
+
+    @Override public void setFailureCallback(FailureCallback callback) {
+        failureCallback = callback;
+    }
 
     @Override public boolean configure(Object arguments) {
         if (failed) return false;
@@ -124,7 +130,13 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     }
 
     @Override public void onMotionEvent(@NonNull MotionEvent source) {
-        if (!shouldStartOrContinue(source)) return;
+        if (!enabled || failed) return;
+        if (!shouldStartOrContinue(source)) {
+            if (source.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                rejectNativeDown(source);
+            }
+            return;
+        }
         MotionEvent event = null;
         MotionEvent prediction = null;
         try {
@@ -171,15 +183,23 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     private void start(MotionEvent event, MotionEvent original) {
         if (!active.isEmpty()) {
             cancelActiveStroke();
+            rejectNativeDown(event);
             return;
         }
-        if (handoff.retainedCount() != 0 || !inOverlay(event, 0)) return;
+        if (handoff.retainedCount() != 0 || !inOverlay(event, 0)) {
+            rejectNativeDown(event);
+            return;
+        }
         int pointer = event.getPointerId(0);
         InProgressStrokeId stroke = view.startStroke(event, pointer, brush);
         active.put(pointer, stroke);
         handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, stroke);
         flutterInputView.requestUnbufferedDispatch(original);
         removeEvicted();
+    }
+
+    private void rejectNativeDown(MotionEvent event) {
+        handoff.rejectNativeStroke(generation, event.getEventTime() * 1_000L);
     }
 
     private void append(MotionEvent event, MotionEvent prediction) {
@@ -241,8 +261,13 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
         Number requested = state == null ? null : number(state.get("generation"));
         Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (!enabled || requested == null || sequence == null || source == null
+        if (requested == null || sequence == null || source == null
                 || requested.longValue() != generation) return;
+        if (!enabled) {
+            handoff.cancel(requested.longValue(), sequence.longValue(), source.longValue());
+            removeEvicted();
+            return;
+        }
         handoff.register(new InkHandoffCoordinator.Registration(
                 requested.longValue(), sequence.longValue(), source.longValue()));
         removeEvicted();
@@ -317,6 +342,8 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
         removeAllFinished();
         handoff.clear();
         view.setVisibility(View.INVISIBLE);
+        FailureCallback callback = failureCallback;
+        if (callback != null) callback.onFailure(generation);
     }
 
     private void cancelAll() {

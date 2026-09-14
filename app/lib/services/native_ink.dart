@@ -296,7 +296,9 @@ class NativeInkBridge {
   int _controlEpoch = 0;
   int _activationTicket = 0;
   bool _activationInFlight = false;
+  bool _failureBlocked = false;
   bool _retireForegrounds = false;
+  NativeInkState? _failedState;
   NativeInkState? _state;
   ({
     Handler handler,
@@ -323,6 +325,20 @@ class NativeInkBridge {
   }
 
   Future<Object?> _handleMethodCall(MethodCall call) async {
+    if (call.method == 'nativeFailure') {
+      final generation = call.arguments;
+      if (generation is int && _state?.generation == generation) {
+        _failedState = _state;
+        _controlEpoch++;
+        _enabled = false;
+        _activationInFlight = false;
+        _pendingFrameCallback = null;
+        _state = null;
+        _clearHandoff();
+        _failureBlocked = true;
+      }
+      return null;
+    }
     if (call.method != 'armChanged') return null;
     if (call.arguments == 'FLUTTER_ONLY') {
       unawaited(disable());
@@ -404,6 +420,21 @@ class NativeInkBridge {
       streamline: property.streamline,
       pressurePolicy: settings.ignorePressure,
     );
+    if (_failureBlocked) {
+      final failed = _failedState;
+      if (failed == null ||
+          _sameConfiguration(
+            failed,
+            brush,
+            geometry,
+            canvasBounds,
+            devicePixelRatio,
+          )) {
+        return null;
+      }
+      _failureBlocked = false;
+      _failedState = null;
+    }
     final previous = _state;
     if (previous != null &&
         _sameConfiguration(
@@ -479,6 +510,8 @@ class NativeInkBridge {
 
   void disarm({bool notifyNative = true}) {
     final generation = _state?.generation;
+    _failureBlocked = false;
+    _failedState = null;
     _controlEpoch++;
     _enabled = false;
     _pendingFrameCallback = null;

@@ -28,9 +28,18 @@ public class StylusLatencyCoreTest {
         handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
         assertNull(handoff.cancel(7, 1, 10_000));
         handoff.addNativeStroke(7, 20_000, "next");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 20_000));
-        assertNull(handoff.markNativeFinished("next"));
-        assertEquals("next", handoff.acknowledge(7, 1, 20_000, "element", 2));
+        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
+        handoff.cancelNative("next");
+        assertNull(handoff.acknowledge(7, 2, 20_000, "element", 2));
+
+        handoff.rejectNativeStroke(7, 30_000);
+        handoff.register(new InkHandoffCoordinator.Registration(7, 3, 30_000));
+        assertNull(handoff.acknowledge(7, 3, 30_000, "declined", 2));
+
+        handoff.addNativeStroke(7, 40_000, "following");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 4, 40_000));
+        assertNull(handoff.markNativeFinished("following"));
+        assertEquals("following", handoff.acknowledge(7, 4, 40_000, "element", 2));
     }
 
     @Test

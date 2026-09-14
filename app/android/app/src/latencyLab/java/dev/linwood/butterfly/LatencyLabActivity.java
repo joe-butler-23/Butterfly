@@ -30,6 +30,7 @@ public final class LatencyLabActivity extends MainActivity {
     @Nullable private StylusWetInkRenderer wetInk;
     private long configuredGeneration = Long.MIN_VALUE;
     private boolean resumed, focused, multiWindow, pictureInPicture;
+    private long failureNotifiedGeneration = Long.MIN_VALUE;
     @Nullable private MethodChannel channel;
     private boolean requestedSignalShown;
     private int lifecycleEpoch;
@@ -92,7 +93,10 @@ public final class LatencyLabActivity extends MainActivity {
                 default -> null;
             };
             StylusWetInkRenderer renderer = wetInk;
-            if (renderer == null || !renderer.configure(arguments)) {
+            if (renderer == null) return false;
+            renderer.setFailureCallback(
+                    generation -> onRendererFailure(renderer, generation));
+            if (!renderer.configure(arguments)) {
                 destroyWetInk();
                 return false;
             }
@@ -216,6 +220,20 @@ public final class LatencyLabActivity extends MainActivity {
         super.onPictureInPictureModeChanged(value);
         pictureInPicture = value;
         applyDisplayPreference();
+    }
+
+    private void onRendererFailure(StylusWetInkRenderer renderer, long failureGeneration) {
+        runOnUiThread(() -> {
+            if (renderer != wetInk || failureGeneration != configuredGeneration
+                    || failureNotifiedGeneration == failureGeneration) return;
+            failureNotifiedGeneration = failureGeneration;
+            destroyWetInk();
+            showFallbackSignal();
+            MethodChannel currentChannel = channel;
+            if (currentChannel != null) {
+                currentChannel.invokeMethod("nativeFailure", failureGeneration);
+            }
+        });
     }
 
     private void destroyWetInk() {

@@ -184,13 +184,27 @@ final class InkHandoffCoordinator<T> {
     void cancelNative(T token) {
         Entry<T> entry = byToken.get(token);
         if (entry == null) return;
-        if (entry.registration == null) {
-            canceledNativeSources.addLast(entry.sourceTimestampUs);
-            while (canceledNativeSources.size() > MAX_RETAINED) {
-                canceledNativeSources.removeFirst();
-            }
-        }
+        reject(entry);
         retire(entry);
+    }
+
+    void rejectNativeStroke(long expectedGeneration, long sourceTimestampUs) {
+        if (quarantined || expectedGeneration != generation || sourceTimestampUs < 0) return;
+        canceledNativeSources.addLast(sourceTimestampUs);
+        while (canceledNativeSources.size() > MAX_RETAINED) {
+            canceledNativeSources.removeFirst();
+        }
+    }
+
+    private void reject(Entry<T> entry) {
+        Registration registration = entry.registration;
+        if (registration == null) {
+            rejectNativeStroke(entry.generation, entry.sourceTimestampUs);
+            return;
+        }
+        Key key = key(registration);
+        pendingAcks.remove(key);
+        pendingCancels.put(key, Boolean.TRUE);
     }
 
     int retainedCount() { return entries.size(); }

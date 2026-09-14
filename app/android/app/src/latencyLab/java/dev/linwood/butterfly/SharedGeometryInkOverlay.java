@@ -152,8 +152,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Nullable private PendingStroke pendingSnapshot;
     @Nullable private Snapshot latestSnapshot;
     @Nullable private ActivationCallback activationCallback;
-    @Nullable private Runnable acknowledgementCompletion;
-    private boolean drainPosted;
+    @Nullable private FailureCallback failureCallback;
+    private boolean drainPosted, frontRenderOutstanding;
     private boolean configured, enabled, attached, surfaceReady, rendererControlReady, ready;
     private boolean surfaceCallbackRegistered, failed, clearRequested;
     private long generation = Long.MIN_VALUE;
@@ -185,6 +185,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     @Override public View getView() { return view; }
+
+    @Override public void setFailureCallback(FailureCallback callback) {
+        failureCallback = callback;
+    }
 
     @Override public boolean configure(Object arguments) {
         if (failed) return false;
@@ -290,8 +294,11 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     @Override public void onMotionEvent(@NonNull MotionEvent event) {
         if (!enabled || failed || !ready) return;
-        if (clearRequested || pendingClear.get() != 0) return;
         int action = event.getActionMasked();
+        if (clearRequested || pendingClear.get() != 0) {
+            if (action == MotionEvent.ACTION_DOWN) rejectNativeDown(event);
+            return;
+        }
         int index = event.getActionIndex();
         boolean active = activePointer != -1;
         if (action == MotionEvent.ACTION_CANCEL
@@ -299,6 +306,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 || event.getPointerCount() != 1 || index != 0
                 || !eligibleSample(event, index)) {
             if (active) abortStroke();
+            else if (action == MotionEvent.ACTION_DOWN) rejectNativeDown(event);
             return;
         }
         view.getLocationInWindow(location);
@@ -329,9 +337,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private void begin(MotionEvent event, int pointer, float locationX, float locationY) {
         if (activePointer != -1) {
             abortStroke();
+            rejectNativeDown(event);
             return;
         }
-        if (handoff.retainedCount() != 0 || !inCanvas(event, 0)) return;
+        if (handoff.retainedCount() != 0 || !inCanvas(event, 0)) {
+            rejectNativeDown(event);
+            return;
+        }
         activePointer = pointer;
         activeToken = ++nextToken;
         points.clear();
@@ -340,8 +352,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (!appendEvent(event, 0, false, locationX, locationY)) abortStroke();
     }
 
+    private void rejectNativeDown(MotionEvent event) {
+        handoff.rejectNativeStroke(generation, event.getEventTime() * 1_000L);
+    }
+
     private boolean appendEvent(MotionEvent event, int pointerIndex, boolean complete,
             float locationX, float locationY) {
+        int initialPointCount = points.size();
         for (int history = 0; history < event.getHistorySize(); history++) {
             if (!appendPoint(event.getHistoricalX(pointerIndex, history),
                     event.getHistoricalY(pointerIndex, history),
@@ -353,7 +370,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             return false;
         }
         if (points.size() < 2) return !complete;
-        submit(complete, !complete && points.size() % CHECKPOINT_POINTS == 0);
+        boolean changed = points.size() != initialPointCount;
+        if (changed || complete) {
+            submit(complete, !complete && points.size() % CHECKPOINT_POINTS == 0);
+        }
         return true;
     }
 
@@ -393,19 +413,19 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             pendingSnapshot = new PendingStroke(activeToken, generation, points, currentPolicy,
                     complete, checkpoint);
         }
-        if (!drainPosted) {
-            drainPosted = true;
-            // The first submission is already on the UI thread. Later arrivals are
-            // coalesced at the view boundary while the renderer is busy.
-            if (latestSnapshot == null && pendingFront.get() == 0 && pendingMulti.get() == 0) {
-                drainLatest();
-            } else {
-                view.post(this::drainLatest);
-            }
+        if (frontRenderOutstanding || drainPosted) return;
+        drainPosted = true;
+        // The first submission is already on the UI thread. Later arrivals are
+        // coalesced at the view boundary while the renderer is busy.
+        if (latestSnapshot == null && pendingFront.get() == 0 && pendingMulti.get() == 0) {
+            drainLatest();
+        } else {
+            view.post(this::drainLatest);
         }
     }
 
     private void drainLatest() {
+        if (frontRenderOutstanding) return;
         drainPosted = false;
         PendingStroke pending = pendingSnapshot;
         pendingSnapshot = null;
@@ -414,6 +434,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (snapshot == null || currentRenderer == null || failed || !enabled
                 || snapshot.generation != generation) return;
         latestSnapshot = snapshot;
+        frontRenderOutstanding = true;
         try {
             currentRenderer.renderFrontBufferedLayer(Request.stroke(snapshot));
             if (snapshot.complete || snapshot.checkpoint) {
@@ -426,6 +447,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 }
             }
         } catch (RuntimeException | LinkageError error) {
+            frontRenderOutstanding = false;
             quarantine();
         }
     }
@@ -450,8 +472,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         Number requested = state == null ? null : number(state.get("generation"));
         Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (!enabled || clearRequested || pendingClear.get() != 0 || requested == null
-                || sequence == null || source == null || requested.longValue() != generation) return;
+        if (requested == null || sequence == null || source == null
+                || requested.longValue() != generation) return;
+        if (!enabled || clearRequested || pendingClear.get() != 0) {
+            handoff.cancel(requested.longValue(), sequence.longValue(), source.longValue());
+            checkHandoff();
+            return;
+        }
         handoff.register(new InkHandoffCoordinator.Registration(requested.longValue(),
                 sequence.longValue(), source.longValue()));
         checkHandoff();
@@ -464,17 +491,14 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
         Number count = state == null ? null : number(state.get("finalPointCount"));
         Object id = state == null ? null : state.get("finalElementId");
-        if (!enabled || requested == null || sequence == null || source == null
-                || count == null || !(id instanceof String) || acknowledgementCompletion != null) {
-            completion.run();
-            if (acknowledgementCompletion != null) quarantine();
-            return;
+        if (enabled && requested != null && sequence != null && source != null
+                && count != null && id instanceof String) {
+            Long token = handoff.acknowledge(requested.longValue(), sequence.longValue(),
+                    source.longValue(), (String) id, count.intValue());
+            if (token != null) clearToken(token);
+            checkHandoff();
         }
-        Long token = handoff.acknowledge(requested.longValue(), sequence.longValue(),
-                source.longValue(), (String) id, count.intValue());
-        if (token == null) acknowledgementCompletion = completion;
-        else clearToken(token, completion);
-        checkHandoff();
+        completion.run();
     }
 
     @Override public void cancelRegisteredStroke(Object arguments) {
@@ -485,35 +509,29 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (requested == null || sequence == null || source == null) return;
         Long token = handoff.cancel(requested.longValue(), sequence.longValue(),
                 source.longValue());
-        if (token != null) clearToken(token, null);
+        if (token != null) clearToken(token);
         checkHandoff();
     }
 
     private void nativeFinished(long token, long callbackGeneration) {
         if (!enabled || failed || callbackGeneration != generation) return;
         Long removable = handoff.markNativeFinished(token);
-        if (removable != null) {
-            Runnable completion = acknowledgementCompletion;
-            acknowledgementCompletion = null;
-            clearToken(removable, completion);
-        }
+        if (removable != null) clearToken(removable);
         checkHandoff();
     }
 
-    private void clearToken(long token, @Nullable Runnable completion) {
+    private void clearToken(long token) {
         Snapshot snapshot = latestSnapshot;
         if (snapshot == null || snapshot.token != token || clearRequested) {
-            if (completion != null) completion.run();
             quarantine();
             return;
         }
-        acknowledgementCompletion = completion;
         clearRequested = true;
         maybeIssueClear();
     }
 
     private void checkHandoff() {
-        for (Long token : handoff.drainEvictedTokens()) clearToken(token, null);
+        for (Long token : handoff.drainEvictedTokens()) clearToken(token);
         if (handoff.isQuarantined()) quarantine();
     }
 
@@ -541,9 +559,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         latestSnapshot = null;
         activeToken = Long.MIN_VALUE;
         points.clear();
-        Runnable completion = acknowledgementCompletion;
-        acknowledgementCompletion = null;
-        if (completion != null) completion.run();
     }
 
     @Override public void disable() {
@@ -553,12 +568,12 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         clearRequested = false;
         pendingSnapshot = null;
         drainPosted = false;
+        frontRenderOutstanding = false;
         activePointer = -1;
         activeToken = Long.MIN_VALUE;
         points.clear();
         handoff.clear();
         resolveActivation(false);
-        releaseAcknowledgement();
         view.setVisibility(View.INVISIBLE);
         releaseRenderer();
         bounds = null;
@@ -617,8 +632,12 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 return;
             }
             pendingFront.decrementAndGet();
+            frontRenderOutstanding = false;
             recordCommitted(transaction, record, false);
-            view.post(SharedGeometryInkOverlay.this::maybeIssueClear);
+            view.post(() -> {
+                drainLatest();
+                maybeIssueClear();
+            });
         }
 
         @Override public void onMultiBufferedLayerRenderComplete(SurfaceControlCompat front,
@@ -734,10 +753,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private void postFailure() { view.post(this::quarantine); }
 
     private void quarantine() {
-        if (failed) {
-            releaseAcknowledgement();
-            return;
-        }
+        if (failed) return;
         failed = true;
         configured = false;
         enabled = false;
@@ -745,14 +761,9 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         handoff.clear();
         view.setVisibility(View.INVISIBLE);
         resolveActivation(false);
-        releaseAcknowledgement();
         releaseRenderer();
-    }
-
-    private void releaseAcknowledgement() {
-        Runnable completion = acknowledgementCompletion;
-        acknowledgementCompletion = null;
-        if (completion != null) completion.run();
+        FailureCallback callback = failureCallback;
+        if (callback != null) callback.onFailure(generation);
     }
 
     private void releaseRenderer() {
@@ -764,6 +775,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         renderer = null;
         frontCallbacks.clear();
         multiCallbacks.clear();
+        frontRenderOutstanding = false;
         pendingFront.set(0);
         pendingMulti.set(0);
         pendingTransactions.set(0);

@@ -7,8 +7,10 @@ import androidx.annotation.NonNull;
 
 interface StylusWetInkRenderer {
     interface ActivationCallback { void onActivated(boolean enabled); }
+    interface FailureCallback { void onFailure(long generation); }
 
     View getView();
+    void setFailureCallback(FailureCallback callback);
     boolean configure(Object arguments);
     boolean enable(Object arguments);
     void awaitActivation(ActivationCallback callback);
