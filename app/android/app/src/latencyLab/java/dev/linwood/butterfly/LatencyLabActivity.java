@@ -50,7 +50,12 @@ public final class LatencyLabActivity extends MainActivity {
                     switch (call.method) {
                         case "configure" -> {
                             boolean configured = configureWetInk(call.arguments);
-                            if (!configured) showFallbackSignal();
+                            // Flutter-only has nothing to fall back from, and a configure
+                            // that arrives before onResume is retried by Dart, not a failure.
+                            if (!configured && resumed
+                                    && mode != StylusLatencyMode.Value.FLUTTER_ONLY) {
+                                showFallbackSignal();
+                            }
                             result.success(configured);
                         }
                         case "enable" -> enableWetInk(call.arguments, result);
