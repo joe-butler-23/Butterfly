@@ -120,9 +120,10 @@ public final class LatencyLabActivity extends MainActivity {
             }
             int epoch = lifecycleEpoch;
             if (!renderer.attachAndPrewarm()) {
+                boolean failureAlreadySignaled = renderer != wetInk;
                 destroyWetInk();
                 result.success(false);
-                showFallbackSignal();
+                if (!failureAlreadySignaled) showFallbackSignal();
                 return;
             }
             renderer.awaitActivation(enabled -> {

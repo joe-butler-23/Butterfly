@@ -413,11 +413,12 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             pendingSnapshot = new PendingStroke(activeToken, generation, points, currentPolicy,
                     complete, checkpoint);
         }
-        if (frontRenderOutstanding || drainPosted) return;
+        if (frontRenderOutstanding || drainPosted || pendingFront.get() != 0
+                || pendingMulti.get() != 0) return;
         drainPosted = true;
         // The first submission is already on the UI thread. Later arrivals are
         // coalesced at the view boundary while the renderer is busy.
-        if (latestSnapshot == null && pendingFront.get() == 0 && pendingMulti.get() == 0) {
+        if (latestSnapshot == null) {
             drainLatest();
         } else {
             view.post(this::drainLatest);
@@ -425,7 +426,9 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     private void drainLatest() {
-        if (frontRenderOutstanding) return;
+        if (frontRenderOutstanding || pendingFront.get() != 0 || pendingMulti.get() != 0) {
+            return;
+        }
         drainPosted = false;
         PendingStroke pending = pendingSnapshot;
         pendingSnapshot = null;
@@ -437,19 +440,39 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         frontRenderOutstanding = true;
         try {
             currentRenderer.renderFrontBufferedLayer(Request.stroke(snapshot));
-            if (snapshot.complete || snapshot.checkpoint) {
-                pendingMulti.incrementAndGet();
-                try {
-                    currentRenderer.commit();
-                } catch (RuntimeException | LinkageError error) {
-                    pendingMulti.decrementAndGet();
-                    throw error;
-                }
-            }
         } catch (RuntimeException | LinkageError error) {
             frontRenderOutstanding = false;
             quarantine();
         }
+    }
+
+    private void completeFrontRender(CallbackRecord record) {
+        Snapshot snapshot = record.snapshot;
+        if (snapshot == null || !record.successful || failed || !enabled
+                || snapshot.generation != generation) {
+            frontRenderOutstanding = false;
+            return;
+        }
+        if (snapshot.complete || snapshot.checkpoint) {
+            CanvasFrontBufferedRenderer<Request> currentRenderer = renderer;
+            if (currentRenderer == null) {
+                frontRenderOutstanding = false;
+                quarantine();
+                return;
+            }
+            pendingMulti.incrementAndGet();
+            try {
+                currentRenderer.commit();
+            } catch (RuntimeException | LinkageError error) {
+                pendingMulti.decrementAndGet();
+                frontRenderOutstanding = false;
+                quarantine();
+                return;
+            }
+        }
+        frontRenderOutstanding = false;
+        drainLatest();
+        maybeIssueClear();
     }
 
     private void abortStroke() {
@@ -632,12 +655,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 return;
             }
             pendingFront.decrementAndGet();
-            frontRenderOutstanding = false;
             recordCommitted(transaction, record, false);
-            view.post(() -> {
-                drainLatest();
-                maybeIssueClear();
-            });
+            view.post(() -> completeFrontRender(record));
         }
 
         @Override public void onMultiBufferedLayerRenderComplete(SurfaceControlCompat front,
@@ -672,7 +691,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             } else {
                 recordCommitted(transaction, record, true);
             }
-            view.post(SharedGeometryInkOverlay.this::maybeIssueClear);
+            view.post(() -> {
+                drainLatest();
+                maybeIssueClear();
+            });
         }
 
         private void recordCommitted(SurfaceControlCompat.Transaction transaction,
