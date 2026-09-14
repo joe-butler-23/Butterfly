@@ -110,7 +110,7 @@ final class InkHandoffCoordinator<T> {
         }
         Key key = key(registration);
         if (removeCanceledNativeSource(registration.sourceTimestampUs)) {
-            if (pendingCancels.remove(key) == null) pendingCancels.put(key, Boolean.TRUE);
+            retainCancel(key);
             return;
         }
         if (pendingCancels.remove(key) != null) {
@@ -164,14 +164,16 @@ final class InkHandoffCoordinator<T> {
         if (quarantined || expectedGeneration != generation || sequence <= 0
                 || sourceTimestampUs < 0) return null;
         Key key = new Key(expectedGeneration, sequence, sourceTimestampUs);
+        if (pendingCancels.remove(key) != null) {
+            pendingAcks.remove(key);
+            removePending(key);
+            return null;
+        }
         pendingAcks.remove(key);
         removePending(key);
         Entry<T> entry = bySequence.get(sequence);
         if (entry == null) {
-            pendingCancels.put(key, Boolean.TRUE);
-            if (pendingAcks.size() + pendingCancels.size() > MAX_RETAINED) {
-                quarantineAndEvict();
-            }
+            retainCancel(key);
             return null;
         }
         if (entry.registration.sourceTimestampUs != sourceTimestampUs) {
@@ -202,9 +204,15 @@ final class InkHandoffCoordinator<T> {
             rejectNativeStroke(entry.generation, entry.sourceTimestampUs);
             return;
         }
-        Key key = key(registration);
+        retainCancel(key(registration));
+    }
+
+    private void retainCancel(Key key) {
         pendingAcks.remove(key);
         pendingCancels.put(key, Boolean.TRUE);
+        if (pendingAcks.size() + pendingCancels.size() > MAX_RETAINED) {
+            quarantineAndEvict();
+        }
     }
 
     int retainedCount() { return entries.size(); }

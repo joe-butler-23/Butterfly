@@ -2,6 +2,7 @@ package dev.linwood.butterfly;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -40,6 +41,54 @@ public class StylusLatencyCoreTest {
         handoff.register(new InkHandoffCoordinator.Registration(7, 4, 40_000));
         assertNull(handoff.markNativeFinished("following"));
         assertEquals("following", handoff.acknowledge(7, 4, 40_000, "element", 2));
+    }
+
+    @Test
+    public void rejectedRegistrationCancelIsConsumed() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        handoff.rejectNativeStroke(7, 10_000);
+        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
+        assertNull(handoff.cancel(7, 1, 10_000));
+
+        handoff.addNativeStroke(7, 20_000, "following");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
+        assertNull(handoff.markNativeFinished("following"));
+        assertEquals("following", handoff.acknowledge(7, 2, 20_000, "element", 2));
+    }
+
+    @Test
+    public void canceledAfterRegistrationCancelIsConsumed() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        handoff.addNativeStroke(7, 10_000, "canceled");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
+        handoff.cancelNative("canceled");
+        assertNull(handoff.cancel(7, 1, 10_000));
+
+        handoff.addNativeStroke(7, 20_000, "following");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
+        assertNull(handoff.markNativeFinished("following"));
+        assertEquals("following", handoff.acknowledge(7, 2, 20_000, "element", 2));
+    }
+
+    @Test
+    public void unconsumedCancelTombstonesAreBounded() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        for (int sequence = 1; sequence <= 8; sequence++) {
+            long source = sequence * 10_000L;
+            handoff.rejectNativeStroke(7, source);
+            handoff.register(new InkHandoffCoordinator.Registration(7, sequence, source));
+        }
+        for (int sequence = 9; sequence <= 17; sequence++) {
+            long source = sequence * 10_000L;
+            String token = "canceled-" + sequence;
+            handoff.addNativeStroke(7, source, token);
+            handoff.register(new InkHandoffCoordinator.Registration(7, sequence, source));
+            handoff.cancelNative(token);
+        }
+        assertTrue(handoff.isQuarantined());
     }
 
     @Test
