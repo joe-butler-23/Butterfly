@@ -91,19 +91,39 @@ part 'stamp.dart';
 part 'texture.dart';
 part 'undo.dart';
 
+const nativeInkLabEnabled = bool.fromEnvironment('BUTTERFLY_DIRECT_INK_LAB');
+
+typedef NativeInkStrokeIdentity = ({
+  int generation,
+  int strokeSequence,
+  int sourceTimestampUs,
+});
+
 @immutable
 class EventContext {
   final BuildContext buildContext;
   final Size viewportSize;
   final bool isShiftPressed, isAltPressed, isCtrlPressed;
+  final NativeInkStrokeIdentity? Function(PointerDownEvent event)?
+  registerNativeInkStroke;
+  final void Function(
+    NativeInkStrokeIdentity identity,
+    String elementId,
+    int pointCount,
+  )?
+  markNativeInkFinalStroke;
+  final void Function(NativeInkStrokeIdentity identity)? cancelNativeInkStroke;
 
   const EventContext(
     this.buildContext,
     this.viewportSize,
     this.isShiftPressed,
     this.isAltPressed,
-    this.isCtrlPressed,
-  );
+    this.isCtrlPressed, {
+    this.registerNativeInkStroke,
+    this.markNativeInkFinalStroke,
+    this.cancelNativeInkStroke,
+  });
 
   DocumentBloc getDocumentBloc() => BlocProvider.of<DocumentBloc>(buildContext);
   DocumentLoadSuccess? getState() {
@@ -238,6 +258,10 @@ abstract class Handler<T> {
 
   bool onRenderersCreated(DocumentPage page, List<Renderer> renderers) => false;
 
+  bool onForegroundPaintedElements(
+    Iterable<({String elementId, int? pointCount})> elements,
+  ) => false;
+
   void onRenderersReloaded(
     DocumentPage page,
     List<Renderer<PadElement>> renderers,
@@ -253,6 +277,8 @@ abstract class Handler<T> {
   FutureOr<void> onPointerMove(PointerMoveEvent event, EventContext context) {}
 
   FutureOr<void> onPointerUp(PointerUpEvent event, EventContext context) {}
+
+  void onPointerCancel(PointerCancelEvent event, EventContext context) {}
 
   void onPointerHover(PointerHoverEvent event, EventContext context) {}
 

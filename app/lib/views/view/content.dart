@@ -14,6 +14,8 @@ class _LoadedViewport extends StatelessWidget {
     required this.viewportSize,
     required this.input,
     required this.canvasKey,
+    required this.nativeInk,
+    required this.nativeInkLifecycleActive,
     required this.bake,
     required this.delayBake,
   });
@@ -23,6 +25,8 @@ class _LoadedViewport extends StatelessWidget {
   final Size viewportSize;
   final _ViewportInputCoordinator input;
   final GlobalKey<_ViewportCanvasState> canvasKey;
+  final NativeInkBridge? nativeInk;
+  final ValueGetter<bool> nativeInkLifecycleActive;
   final VoidCallback bake;
   final VoidCallback delayBake;
 
@@ -33,7 +37,7 @@ class _LoadedViewport extends StatelessWidget {
     _HandlerGetter getHandler,
   ) {
     EventContext getEventContext() =>
-        input.createEventContext(context, viewportSize);
+        input.createEventContext(context, viewportSize, nativeInk: nativeInk);
     final pointerInput = (
       context: context,
       cubit: cubit,
@@ -71,7 +75,8 @@ class _LoadedViewport extends StatelessWidget {
         onPointerDown: (event) => input.handlePointerDown(event, pointerInput),
         onPointerMove: (event) => input.handlePointerMove(event, pointerInput),
         onPointerUp: (event) => input.handlePointerUp(event, pointerInput),
-        onPointerCancel: (event) => input.handlePointerCancel(event, cubit),
+        onPointerCancel: (event) =>
+            input.handlePointerCancel(event, pointerInput),
         onPointerHover: (event) {
           cubit.inputCubit.updateLastPosition(event.localPosition);
           getHandler().onPointerHover(event, getEventContext());
@@ -81,9 +86,78 @@ class _LoadedViewport extends StatelessWidget {
           rendererState: rendererState,
           documentState: state,
           delayBake: delayBake,
+          onForegroundPaintedElements: nativeInk == null
+              ? null
+              : (receipts) {
+                  final painted = receipts.toList(growable: false);
+                  nativeInk?.acknowledgePaintedElements(painted);
+                  if (!getHandler().onForegroundPaintedElements(painted)) {
+                    return;
+                  }
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (context.mounted) {
+                      unawaited(bloc.refreshForegroundsOnly());
+                    }
+                  });
+                },
         ),
       ),
     );
+  }
+
+  void _scheduleNativeInk(
+    BuildContext context,
+    EditorController cubit,
+    _HandlerGetter getHandler,
+  ) {
+    final nativeInk = this.nativeInk;
+    if (nativeInk == null) return;
+    nativeInk.scheduleAfterFrame(() {
+      if (!context.mounted || !nativeInkLifecycleActive()) return;
+      final renderObject = canvasKey.currentContext?.findRenderObject();
+      if (renderObject is! RenderBox || !renderObject.hasSize) {
+        unawaited(nativeInk.disable());
+        return;
+      }
+      Rect bounds;
+      try {
+        bounds = Rect.fromPoints(
+          renderObject.localToGlobal(Offset.zero),
+          renderObject.localToGlobal(
+            renderObject.size.bottomRight(Offset.zero),
+          ),
+        );
+      } catch (_) {
+        unawaited(nativeInk.disable());
+        return;
+      }
+      final currentState = context.read<DocumentBloc>().state;
+      final handler = currentState is DocumentLoaded
+          ? _getViewportHandler(currentState, cubit)
+          : getHandler();
+      final hasPointerManipulator = cubit
+          .toolCubit
+          .state
+          .toggleableHandlers
+          .values
+          .any((handler) => handler is PointerManipulationHandler);
+      final allowed =
+          currentState is DocumentLoadSuccess &&
+          currentState.currentArea == null &&
+          currentState.currentAreaName.isEmpty &&
+          !hasPointerManipulator &&
+          cubit.saveCubit.state.embedding?.editable != false;
+      unawaited(
+        nativeInk.updateState(
+          handler: handler,
+          settings: context.read<SettingsCubit>().state,
+          canvasBounds: bounds,
+          devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+          camera: cubit.transformCubit.state,
+          allowNativeInk: allowed,
+        ),
+      );
+    });
   }
 
   @override
@@ -91,7 +165,7 @@ class _LoadedViewport extends StatelessWidget {
     final cubit = context.read<EditorController>();
     Handler getHandler() => _getViewportHandler(state, cubit);
 
-    return BlocBuilder<RendererCubit, RendererRuntimeState>(
+    final viewport = BlocBuilder<RendererCubit, RendererRuntimeState>(
       buildWhen: (previous, current) =>
           previous.cameraViewport != current.cameraViewport ||
           previous.rendererStates != current.rendererStates ||
@@ -108,8 +182,9 @@ class _LoadedViewport extends StatelessWidget {
               final viewportMatches =
                   (realSize.width - viewportSize.width).abs() < 2 &&
                   (realSize.height - viewportSize.height).abs() < 2;
-              if (state is DocumentLoadSuccess && !viewportMatches) {
-                bake();
+              if (state is DocumentLoadSuccess && !viewportMatches) bake();
+              if (nativeInk != null) {
+                _scheduleNativeInk(context, cubit, getHandler);
               }
 
               return Actions(
@@ -132,6 +207,24 @@ class _LoadedViewport extends StatelessWidget {
               );
             },
           ),
+    );
+    if (nativeInk == null) return viewport;
+    return MultiBlocListener(
+      listeners: [
+        BlocListener<TransformCubit, CameraTransform>(
+          listener: (context, _) =>
+              _scheduleNativeInk(context, cubit, getHandler),
+        ),
+        BlocListener<SettingsCubit, ButterflySettings>(
+          listener: (context, _) =>
+              _scheduleNativeInk(context, cubit, getHandler),
+        ),
+        BlocListener<ToolCubit, ToolRuntimeState>(
+          listener: (context, _) =>
+              _scheduleNativeInk(context, cubit, getHandler),
+        ),
+      ],
+      child: viewport,
     );
   }
 }

@@ -7,6 +7,11 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   final Map<int, PenElement> elements = {};
   final Map<int, List<PathPoint>> _elementPoints = {};
   final List<PenElement> _submittedElements = [];
+  final Map<int, void Function(String elementId, int pointCount)>?
+  _nativeInkFinalizers = nativeInkLabEnabled ? {} : null;
+  final Map<int, VoidCallback>? _nativeInkCancellers = nativeInkLabEnabled
+      ? {}
+      : null;
   // Map to store the last positions of each element.
   final Map<int, Offset> lastPosition = {};
   // List for shapeDetection
@@ -21,6 +26,17 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
 
   PenHandler(super.data);
 
+  void _clearShapeDetection() {
+    _positionCheckTimer?.cancel();
+    _positionCheckTimer = null;
+    if (points.isNotEmpty) points.clear();
+  }
+
+  void _cancelNativeInk(int pointer) {
+    _nativeInkCancellers?.remove(pointer)?.call();
+    _nativeInkFinalizers?.remove(pointer);
+  }
+
   // Create foregrounds for rendering the PenRendere
   @override
   List<Renderer> createForegrounds(
@@ -30,24 +46,22 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     DocumentInfo info, [
     Area? currentArea,
   ]) => [...elements.values, ..._submittedElements]
-      .map(
-        (e) => e.points.length > 1
-            ? PenRenderer(e.copyWith(id: createUniqueId()))
-            : null,
-      )
+      .map((e) => e.points.length > 1 ? PenRenderer(e) : null)
       .whereType<Renderer>()
       .toList();
 
   // Reset the input for the handler.
   @override
   void resetInput(DocumentBloc bloc) {
+    for (final pointer
+        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+      _cancelNativeInk(pointer);
+    }
     submitElements(bloc, elements.keys.toList());
-    _positionCheckTimer?.cancel();
-    _positionCheckTimer = null;
+    _clearShapeDetection();
     elements.clear();
     _elementPoints.clear();
     lastPosition.clear();
-    points.clear();
     lastPosit = null;
   }
 
@@ -55,9 +69,8 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   @override
   void onPointerUp(PointerUpEvent event, EventContext context) {
     isDrawing = false;
-    // Cancel the timer when the pointer is lifted, preventing shape detection
-    _positionCheckTimer?.cancel();
-    _positionCheckTimer = null;
+    // Cancel shape detection before finalizing the stroke.
+    _clearShapeDetection();
     addPoint(
       context.buildContext,
       event.pointer,
@@ -69,8 +82,19 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     );
     lastPosition.remove(event.pointer);
     submitElements(context.getDocumentBloc(), [event.pointer]);
-    points.clear();
     lastPosit = null;
+  }
+
+  @override
+  void onPointerCancel(PointerCancelEvent event, EventContext context) {
+    _clearShapeDetection();
+    _cancelNativeInk(event.pointer);
+    elements.remove(event.pointer);
+    _elementPoints.remove(event.pointer);
+    lastPosition.remove(event.pointer);
+    isDrawing = elements.isNotEmpty;
+    lastPosit = null;
+    unawaited(context.refreshForegrounds());
   }
 
   DocumentBloc? _bloc;
@@ -78,22 +102,34 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   // Submit elements for processing and rendering.
   Future<void> submitElements(DocumentBloc bloc, List<int> indexes) async {
     _bloc = bloc;
-    final elements = indexes
-        .map((e) {
-          final element = this.elements.remove(e);
-          final points = _elementPoints.remove(e);
-          if (element == null) return null;
-          return points == null
-              ? element
-              : element.copyWith(points: List<PathPoint>.of(points));
-        })
-        .nonNulls
-        .toList();
-    if (elements.isEmpty) return;
-    _submittedElements.addAll(elements);
+    final submitted = <(int, PenElement)>[];
+    for (final pointer in indexes) {
+      final element = elements.remove(pointer);
+      final points = _elementPoints.remove(pointer);
+      if (element == null) continue;
+      submitted.add((
+        pointer,
+        points == null
+            ? element
+            : element.copyWith(points: List<PathPoint>.of(points)),
+      ));
+    }
+    final submittedElements = submitted.map((entry) => entry.$2).toList();
+    if (submittedElements.isEmpty) return;
+    _submittedElements.addAll(submittedElements);
+    for (final (pointer, element) in submitted) {
+      final cancel = _nativeInkCancellers?.remove(pointer);
+      final finalize = _nativeInkFinalizers?.remove(pointer);
+      final id = element.id;
+      if (finalize != null && id != null && element.points.length > 1) {
+        finalize(id, element.points.length);
+      } else {
+        cancel?.call();
+      }
+    }
     lastPosition.removeWhere((key, value) => indexes.contains(key));
-    bloc.add(ElementsCreated(elements));
-    bloc.refresh(allowBake: false);
+    bloc.add(ElementsCreated(submittedElements));
+    unawaited(bloc.refreshForegroundsOnly());
   }
 
   @override
@@ -107,9 +143,38 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
         .toSet();
     if (createdIds.isEmpty) return false;
     final previousLength = _submittedElements.length;
-    _submittedElements.removeWhere((e) => createdIds.contains(e.id));
+    _submittedElements.removeWhere(
+      (element) =>
+          createdIds.contains(element.id) &&
+          (!nativeInkLabEnabled || element.points.length <= 1),
+    );
     final changed = previousLength != _submittedElements.length;
     if (changed && _submittedElements.isEmpty && elements.isEmpty) {
+      unawaited(_bloc?.delayedBake());
+    }
+    return changed;
+  }
+
+  @override
+  bool onForegroundPaintedElements(
+    Iterable<({String elementId, int? pointCount})> elements,
+  ) {
+    if (!nativeInkLabEnabled || _submittedElements.isEmpty) return false;
+    final painted = <String, Set<int>>{};
+    for (final receipt in elements) {
+      final pointCount = receipt.pointCount;
+      if (pointCount != null) {
+        (painted[receipt.elementId] ??= {}).add(pointCount);
+      }
+    }
+    final previousLength = _submittedElements.length;
+    _submittedElements.removeWhere((element) {
+      final id = element.id;
+      return id != null &&
+          (painted[id]?.contains(element.points.length) ?? false);
+    });
+    final changed = previousLength != _submittedElements.length;
+    if (changed && _submittedElements.isEmpty && this.elements.isEmpty) {
       unawaited(_bloc?.delayedBake());
     }
     return changed;
@@ -120,7 +185,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     CameraViewport currentViewport,
     CameraViewport newViewport,
   ) async {
-    if (_submittedElements.isEmpty) return;
+    if (_submittedElements.isEmpty || nativeInkLabEnabled) return;
     final submittedIds = _submittedElements.map((e) => e.id).nonNulls.toSet();
     final viewportIds = [
       ...newViewport.bakedElements,
@@ -199,7 +264,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
         points: points,
       );
     }
-    if (refresh) unawaited(bloc.delayedRefreshForegrounds());
+    if (refresh) unawaited(bloc.delayedRefreshForegroundsOnly());
   }
 
   // This function is called when the pointer is pressed down.
@@ -226,6 +291,26 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
       event.kind,
       shouldCreate: true,
     );
+    final register = context.registerNativeInkStroke;
+    final finalize = context.markNativeInkFinalStroke;
+    if (elements.containsKey(event.pointer) &&
+        event.kind == PointerDeviceKind.stylus &&
+        event.buttons & ~kStylusContact == 0 &&
+        !context.isShiftPressed &&
+        !context.isAltPressed &&
+        !context.isCtrlPressed &&
+        register != null &&
+        finalize != null) {
+      final identity = register(event);
+      if (identity != null) {
+        _nativeInkFinalizers?[event.pointer] = (elementId, pointCount) =>
+            finalize(identity, elementId, pointCount);
+        final cancel = context.cancelNativeInkStroke;
+        if (cancel != null) {
+          _nativeInkCancellers?[event.pointer] = () => cancel(identity);
+        }
+      }
+    }
   }
 
   @override
@@ -235,15 +320,19 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     if (lastPosit == event.localPosition) return;
     // Update the current position with the new position of the pointer
     lastPosit = event.localPosition;
-    // Cancel any existing timer
-    _positionCheckTimer?.cancel();
-    // Start a new timer that will call the shape detection after a delay by data.shapeDetectionTime
-    _positionCheckTimer = Timer(
-      Duration(milliseconds: (data.shapeDetectionTime * 1000).round()),
-      () {
-        _tickShapeDetection(event.pointer, context, event.localPosition);
-      },
-    );
+    if (data.shapeDetectionEnabled) {
+      _positionCheckTimer?.cancel();
+      _positionCheckTimer = Timer(
+        Duration(milliseconds: (data.shapeDetectionTime * 1000).round()),
+        () {
+          _positionCheckTimer = null;
+          _tickShapeDetection(event.pointer, context, event.localPosition);
+        },
+      );
+      points.add(event.localPosition);
+    } else {
+      _clearShapeDetection();
+    }
     // Call the addPoint function to add a point to the current brush stroke.
     addPoint(
       context.buildContext,
@@ -253,7 +342,6 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
       getPressureOfEvent(event),
       event.kind,
     );
-    points.add(event.localPosition);
   }
 
   void showMessage(EventContext context, String recognizedShape) {
@@ -274,7 +362,10 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     EventContext context,
     Offset localPosition,
   ) {
-    if (!data.shapeDetectionEnabled) return;
+    if (!data.shapeDetectionEnabled) {
+      _clearShapeDetection();
+      return;
+    }
     final element = elements[pointer];
     if (element == null || points.length > 600 || points.isEmpty) {
       return;
@@ -450,10 +541,12 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
 
   @override
   void onScaleStartAbort(ScaleStartDetails details, EventContext context) {
-    _positionCheckTimer?.cancel();
-    _positionCheckTimer = null;
+    _clearShapeDetection();
+    for (final pointer
+        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+      _cancelNativeInk(pointer);
+    }
     elements.clear();
-    points.clear();
     lastPosition.clear();
     lastPosit = null;
     context.refresh();
@@ -461,12 +554,14 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
 
   @override
   void dispose(DocumentBloc bloc) {
-    _positionCheckTimer?.cancel();
-    _positionCheckTimer = null;
+    _clearShapeDetection();
+    for (final pointer
+        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+      _cancelNativeInk(pointer);
+    }
     elements.clear();
     _submittedElements.clear();
     lastPosition.clear();
-    points.clear();
     isDrawing = false;
     lastPosit = null;
     _bloc = null;

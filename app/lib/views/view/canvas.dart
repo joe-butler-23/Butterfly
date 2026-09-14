@@ -6,11 +6,14 @@ class _ViewportCanvas extends StatefulWidget {
     required this.rendererState,
     required this.documentState,
     required this.delayBake,
+    this.onForegroundPaintedElements,
   });
 
   final RendererRuntimeState rendererState;
   final DocumentLoaded documentState;
   final VoidCallback delayBake;
+  final ValueChanged<Iterable<PaintedElementReceipt>>?
+  onForegroundPaintedElements;
 
   @override
   State<_ViewportCanvas> createState() => _ViewportCanvasState();
@@ -151,6 +154,7 @@ class _ViewportCanvasState extends State<_ViewportCanvas>
                         visibleTransform,
                         toolState.selection,
                         state.settingsCubit.state.navigatorPosition,
+                        widget.onForegroundPaintedElements,
                       ),
                       willChange: true,
                     ),

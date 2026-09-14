@@ -11,6 +11,17 @@ import 'package:material_leap/material_leap.dart';
 import 'cubits/transform.dart';
 import 'selections/selection.dart';
 
+typedef PaintedElementReceipt = ({String elementId, int? pointCount});
+
+PaintedElementReceipt? _paintedElementReceipt(Renderer renderer) {
+  final element = renderer.element;
+  if (element is! PadElement || element.id == null) return null;
+  return (
+    elementId: element.id!,
+    pointCount: element is PenElement ? element.points.length : null,
+  );
+}
+
 void _paintRenderer(
   Canvas canvas,
   Size size,
@@ -63,6 +74,7 @@ void _paintRenderers(
   ColorScheme? colorScheme,
   Iterable<Renderer> renderers, {
   bool foreground = false,
+  ValueChanged<Iterable<PaintedElementReceipt>>? onPaintedElements,
 }) {
   final rendererList = renderers is List<Renderer>
       ? renderers
@@ -88,6 +100,7 @@ void _paintRenderers(
         foreground: foreground,
       );
     }
+    onPaintedElements?.call(rendererList.map(_paintedElementReceipt).nonNulls);
     return;
   }
   final paintedGroups = <String>{};
@@ -143,6 +156,7 @@ void _paintRenderers(
     }
     canvas.restore();
   }
+  onPaintedElements?.call(rendererList.map(_paintedElementReceipt).nonNulls);
 }
 
 class ForegroundPainter extends CustomPainter {
@@ -154,6 +168,7 @@ class ForegroundPainter extends CustomPainter {
   final CameraTransform transform;
   final Selection? selection;
   final NavigatorPosition navigatorPosition;
+  final ValueChanged<Iterable<PaintedElementReceipt>>? onPaintedElements;
 
   ForegroundPainter(
     this.renderers,
@@ -164,6 +179,7 @@ class ForegroundPainter extends CustomPainter {
     this.transform = const CameraTransform(),
     this.selection,
     this.navigatorPosition = .left,
+    this.onPaintedElements,
   ]);
 
   @override
@@ -181,6 +197,7 @@ class ForegroundPainter extends CustomPainter {
       colorScheme,
       renderers,
       foreground: true,
+      onPaintedElements: onPaintedElements,
     );
     if (sel is ElementSelection) {
       _drawSelection(canvas, size, sel);
@@ -213,7 +230,8 @@ class ForegroundPainter extends CustomPainter {
       oldDelegate.renderers != renderers ||
       oldDelegate.transform != transform ||
       oldDelegate.selection != selection ||
-      oldDelegate.colorScheme != colorScheme;
+      oldDelegate.colorScheme != colorScheme ||
+      oldDelegate.onPaintedElements != onPaintedElements;
 }
 
 class ViewPainter extends CustomPainter {

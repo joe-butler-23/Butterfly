@@ -40,16 +40,25 @@ android {
             dimension = "default"
             applicationIdSuffix = ""
             manifestPlaceholders["appName"] = "Butterfly"
+            manifestPlaceholders["mainActivityClass"] = ".MainActivity"
         }
         create("development") {
             dimension = "default"
             applicationIdSuffix = ""
             manifestPlaceholders["appName"] = "Butterfly Nightly"
+            manifestPlaceholders["mainActivityClass"] = ".MainActivity"
         }
         create("nightly") {
             dimension = "default"
             applicationIdSuffix = ".nightly"
             manifestPlaceholders["appName"] = "Butterfly Nightly"
+            manifestPlaceholders["mainActivityClass"] = ".MainActivity"
+        }
+        create("latencyLab") {
+            dimension = "default"
+            applicationIdSuffix = ".latencylab"
+            manifestPlaceholders["appName"] = "Butterfly Latency Lab"
+            manifestPlaceholders["mainActivityClass"] = ".LatencyLabActivity"
         }
     }
 
@@ -104,4 +113,14 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    add("latencyLabImplementation", "androidx.graphics:graphics-core:1.0.4")
+    add("latencyLabImplementation", "androidx.ink:ink-authoring:1.0.0")
+    add("latencyLabImplementation", "androidx.ink:ink-brush:1.0.0")
+    add("latencyLabImplementation", "androidx.ink:ink-strokes:1.0.0")
+    add("latencyLabImplementation", "androidx.input:input-motionprediction:1.0.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

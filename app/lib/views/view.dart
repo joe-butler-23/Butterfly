@@ -5,6 +5,7 @@ import 'package:butterfly/cubits/editor_controller.dart';
 import 'package:butterfly/cubits/settings.dart';
 import 'package:butterfly/cubits/transform.dart';
 import 'package:butterfly/handlers/handler.dart';
+import 'package:butterfly/services/native_ink.dart';
 import 'package:butterfly/services/pointer_shortcuts.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -41,6 +42,10 @@ class MainViewViewportState extends State<MainViewViewport>
     with WidgetsBindingObserver {
   final GlobalKey<_ViewportCanvasState> _canvasKey = GlobalKey();
   late final _ViewportInputCoordinator _input;
+  NativeInkBridge? _nativeInk;
+  Future<void>? _nativeInkTeardown;
+  bool _nativeInkLifecycleActive = true;
+  int _nativeInkLifecycleEpoch = 0;
   bool _initialBakePending = false;
 
   void openContextMenu() {
@@ -93,6 +98,7 @@ class MainViewViewportState extends State<MainViewViewport>
   @override
   void initState() {
     super.initState();
+    if (nativeInkLabEnabled) _nativeInk = NativeInkBridge();
     _input = _ViewportInputCoordinator((transformCubit) {
       _canvasKey.currentState?.settleSlide(transformCubit);
     });
@@ -102,16 +108,44 @@ class MainViewViewportState extends State<MainViewViewport>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (nativeInkLabEnabled) {
+      _nativeInk?.disarm();
+      unawaited(_nativeInk?.dispose());
+    }
     _input.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final bloc = context.read<DocumentBloc>();
-    if (bloc.state is! DocumentLoadSuccess || state == .resumed) {
+    if (nativeInkLabEnabled) {
+      final epoch = ++_nativeInkLifecycleEpoch;
+      if (state == AppLifecycleState.resumed) {
+        final teardown = _nativeInkTeardown;
+        if (teardown == null) {
+          _nativeInkLifecycleActive = true;
+          if (mounted) setState(() {});
+        } else {
+          _nativeInkLifecycleActive = false;
+          unawaited(
+            teardown.whenComplete(() {
+              if (mounted && epoch == _nativeInkLifecycleEpoch) {
+                _nativeInkLifecycleActive = true;
+                setState(() {});
+              }
+            }),
+          );
+        }
+        return;
+      }
+      _nativeInkLifecycleActive = false;
+      _nativeInk?.disarm();
+      _nativeInkTeardown = _nativeInk?.disable();
+    } else if (state == AppLifecycleState.resumed) {
       return;
     }
+    final bloc = context.read<DocumentBloc>();
+    if (bloc.state is! DocumentLoadSuccess) return;
     _input.reset();
     final controller = context.read<EditorController>();
     controller.toolCubit.resetInput(bloc, controller.inputCubit);
@@ -130,6 +164,9 @@ class MainViewViewportState extends State<MainViewViewport>
             return BlocBuilder<DocumentBloc, DocumentState>(
               builder: (context, state) {
                 if (state is! DocumentLoaded) {
+                  _nativeInk?.scheduleAfterFrame(
+                    () => unawaited(_nativeInk?.disable()),
+                  );
                   return const Center(child: CircularProgressIndicator());
                 }
                 return _LoadedViewport(
@@ -138,6 +175,8 @@ class MainViewViewportState extends State<MainViewViewport>
                   viewportSize: viewportSize,
                   input: _input,
                   canvasKey: _canvasKey,
+                  nativeInk: _nativeInk,
+                  nativeInkLifecycleActive: () => _nativeInkLifecycleActive,
                   bake: () => _scheduleInitialBake(viewportSize),
                   delayBake: () => _delayBake(viewportSize),
                 );

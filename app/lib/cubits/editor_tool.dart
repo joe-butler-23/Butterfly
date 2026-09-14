@@ -37,10 +37,7 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
   this : super(initial ?? ToolRuntimeState(handler: HandHandler()));
 
   final foregroundRefreshRunner = CoalescedAsyncRunner(delay: Duration.zero);
-  final delayedForegroundRefreshRunner = CoalescedAsyncRunner(
-    delay: const Duration(milliseconds: 16),
-    restartDelay: false,
-  );
+  final frameForegroundRefreshRunner = FrameCoalescedAsyncRunner();
   EditorController? _controller;
   Timer? _networkingDebounceTimer;
   final Map<String, Handler<Tool>> _inactiveHandlers = {};
@@ -763,7 +760,7 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
     bool allowBake = true,
   }) async {
     // A full refresh supersedes any frame-delayed drawing preview.
-    delayedForegroundRefreshRunner.cancel();
+    frameForegroundRefreshRunner.cancel();
     talker.verbose('Refreshing tools');
     final document = blocState.data;
     final page = blocState.page;
@@ -907,23 +904,41 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
     EditorController controller,
     DocumentLoaded blocState,
   ) {
-    delayedForegroundRefreshRunner.cancel();
+    frameForegroundRefreshRunner.cancel();
     return foregroundRefreshRunner.schedule(
       () => _refreshForegrounds(controller, blocState),
+    );
+  }
+
+  Future<void> refreshForegroundsOnly(
+    EditorController controller,
+    DocumentLoaded blocState,
+  ) {
+    frameForegroundRefreshRunner.cancel();
+    return foregroundRefreshRunner.schedule(
+      () => _refreshForegrounds(controller, blocState, allowBake: false),
     );
   }
 
   Future<void> delayedRefreshForegrounds(
     EditorController controller,
     DocumentLoaded blocState,
-  ) => delayedForegroundRefreshRunner.schedule(
+  ) => frameForegroundRefreshRunner.schedule(
     () => _refreshForegrounds(controller, blocState),
+  );
+
+  Future<void> delayedRefreshForegroundsOnly(
+    EditorController controller,
+    DocumentLoaded blocState,
+  ) => frameForegroundRefreshRunner.schedule(
+    () => _refreshForegrounds(controller, blocState, allowBake: false),
   );
 
   Future<void> _refreshForegrounds(
     EditorController controller,
-    DocumentLoaded blocState,
-  ) async {
+    DocumentLoaded blocState, {
+    bool allowBake = true,
+  }) async {
     if (controller.isClosed) return;
     final document = blocState.data;
     final page = blocState.page;
@@ -1017,15 +1032,16 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
           : currentTemporaryRendererStates,
     );
 
-    if ((statesChanged || temporaryStatesChanged) && resetBake) {
+    if (allowBake && (statesChanged || temporaryStatesChanged) && resetBake) {
       await controller.rendererCubit.bake(controller, blocState, reset: true);
-    } else if (!controller.rendererCubit.state.cameraViewport.baked ||
-        controller
-            .rendererCubit
-            .state
-            .cameraViewport
-            .unbakedElements
-            .isNotEmpty) {
+    } else if (allowBake &&
+        (!controller.rendererCubit.state.cameraViewport.baked ||
+            controller
+                .rendererCubit
+                .state
+                .cameraViewport
+                .unbakedElements
+                .isNotEmpty)) {
       await controller.rendererCubit.delayedBake(controller, blocState);
     }
   }
@@ -1099,15 +1115,15 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
     _disposeInactiveHandlers(bloc);
     foregroundRefreshRunner.cancel();
     await foregroundRefreshRunner.disposeAndWait();
-    delayedForegroundRefreshRunner.cancel();
-    await delayedForegroundRefreshRunner.disposeAndWait();
+    frameForegroundRefreshRunner.cancel();
+    await frameForegroundRefreshRunner.disposeAndWait();
     _networkingDebounceTimer?.cancel();
     _networkingDebounceTimer = null;
     _controller = null;
   }
 
   @override
-  Future<void> close() {
+  Future<void> close() async {
     _networkingDebounceTimer?.cancel();
     _networkingDebounceTimer = null;
     final bloc = _controller?.activeDocumentBloc;
@@ -1116,6 +1132,10 @@ class ToolCubit([ToolRuntimeState? initial]) extends Cubit<ToolRuntimeState> {
     } else {
       _inactiveHandlers.clear();
     }
+    foregroundRefreshRunner.cancel();
+    await foregroundRefreshRunner.disposeAndWait();
+    frameForegroundRefreshRunner.cancel();
+    await frameForegroundRefreshRunner.disposeAndWait();
     _controller = null;
     return super.close();
   }

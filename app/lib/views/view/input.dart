@@ -27,7 +27,11 @@ class _ViewportInputCoordinator {
 
   void beginTrackpadGesture() => _handlerHandlesScaleGesture = false;
 
-  EventContext createEventContext(BuildContext context, Size viewportSize) {
+  EventContext createEventContext(
+    BuildContext context,
+    Size viewportSize, {
+    NativeInkBridge? nativeInk,
+  }) {
     final keyboard = HardwareKeyboard.instance;
     return EventContext(
       context,
@@ -35,6 +39,9 @@ class _ViewportInputCoordinator {
       keyboard.isShiftPressed,
       keyboard.isAltPressed,
       keyboard.isControlPressed,
+      registerNativeInkStroke: nativeInk?.registerStroke,
+      markNativeInkFinalStroke: nativeInk?.markFinalStroke,
+      cancelNativeInkStroke: nativeInk?.cancelStroke,
     );
   }
 
@@ -158,13 +165,16 @@ class _ViewportInputCoordinator {
     cubit.inputCubit.updateLastPosition(event.localPosition);
     final wasRulerInteraction = _ruler != null;
     _resetRulerInteraction();
-    if (!wasRulerInteraction && _isHandlerGesture) {
-      await input.getHandler().onPointerUp(event, input.getEventContext());
+    try {
+      if (!wasRulerInteraction && _isHandlerGesture) {
+        await input.getHandler().onPointerUp(event, input.getEventContext());
+      }
+    } finally {
+      cubit.inputCubit.removePointer(event.pointer);
+      _pointerKinds.remove(event.pointer);
+      if (wasRulerInteraction) cubit.inputCubit.removeButtons();
+      cubit.toolCubit.resetReleaseHandler(input.bloc, cubit.rendererCubit);
     }
-    cubit.inputCubit.removePointer(event.pointer);
-    _pointerKinds.remove(event.pointer);
-    if (wasRulerInteraction) cubit.inputCubit.removeButtons();
-    cubit.toolCubit.resetReleaseHandler(input.bloc, cubit.rendererCubit);
   }
 
   Future<void> _replayPointerEvents(
@@ -185,14 +195,23 @@ class _ViewportInputCoordinator {
     }
   }
 
-  void handlePointerCancel(PointerCancelEvent event, EditorController cubit) {
-    if (_shortcutManager.pointerCancel(event)) return;
-    _resetRulerInteraction();
-    cubit.inputCubit.removePointer(event.pointer);
-    _pointerKinds.remove(event.pointer);
-    cubit.inputCubit.removeButtons();
-    if (cubit.inputCubit.state.pointers.isEmpty) {
-      _handlerHandlesScaleGesture = null;
+  void handlePointerCancel(
+    PointerCancelEvent event,
+    _PointerInputContext input,
+  ) {
+    final shortcutConsumed = _shortcutManager.pointerCancel(event);
+    try {
+      if (!shortcutConsumed) {
+        input.getHandler().onPointerCancel(event, input.getEventContext());
+      }
+    } finally {
+      _resetRulerInteraction();
+      input.cubit.inputCubit.removePointer(event.pointer);
+      _pointerKinds.remove(event.pointer);
+      input.cubit.inputCubit.removeButtons();
+      if (input.cubit.inputCubit.state.pointers.isEmpty) {
+        _handlerHandlesScaleGesture = null;
+      }
     }
   }
 

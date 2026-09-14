@@ -61,6 +61,22 @@ void main() {
     await runner.disposeAndWait();
   });
 
+  testWidgets('frame runner executes only the latest request at the frame', (
+    tester,
+  ) async {
+    final runner = FrameCoalescedAsyncRunner();
+    final runs = <int>[];
+
+    final first = runner.schedule(() async => runs.add(1));
+    final second = runner.schedule(() async => runs.add(2));
+    expect(runs, isEmpty);
+
+    await tester.pump();
+    await Future.wait([first, second]);
+    expect(runs, [2]);
+    await runner.disposeAndWait();
+  });
+
   testWidgets('default runner retains debounce behavior', (tester) async {
     final runner = CoalescedAsyncRunner(
       delay: const Duration(milliseconds: 16),
