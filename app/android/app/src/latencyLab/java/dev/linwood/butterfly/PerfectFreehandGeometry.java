@@ -203,12 +203,24 @@ final class PerfectFreehandGeometry {
      */
     static List<Point> getStrokeOutlinePoints(
             List<StrokePoint> points, Options options, boolean rememberSimulatedPressure) {
+        return getStrokeOutlineParts(points, options, rememberSimulatedPressure).assemble();
+    }
+
+    /**
+     * Same computation as {@link #getStrokeOutlinePoints}, but returns the left/right rails and
+     * both caps separately instead of the assembled outline. {@link IncrementalOutline} keeps the
+     * same four pieces incrementally; exposing them here lets a test prove the two agree exactly
+     * (see {@code PerfectFreehandGeometryParityTest}) instead of only comparing the final,
+     * already-concatenated outline.
+     */
+    static OutlineParts getStrokeOutlineParts(
+            List<StrokePoint> points, Options options, boolean rememberSimulatedPressure) {
         if (rememberSimulatedPressure && (!options.simulatePressure || !options.isComplete)) {
             throw new IllegalArgumentException(
                     "rememberSimulatedPressure requires simulated pressure and a complete stroke");
         }
         if (points.isEmpty() || options.size <= 0.0) {
-            return new ArrayList<>();
+            return OutlineParts.empty();
         }
 
         double totalLength = points.get(points.size() - 1).runningLength;
@@ -361,7 +373,8 @@ final class PerfectFreehandGeometry {
                 for (double amount = step; amount <= 1.0; amount += step) {
                     dotPoints.add(start.rotAround(firstPoint, PI * 2.0 * amount));
                 }
-                return dotPoints;
+                return new OutlineParts(
+                        dotPoints, new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
             }
         } else if (taperStart > 0.0 || (taperEnd > 0.0 && points.size() == 1)) {
             // Tapered start: no cap.
@@ -396,15 +409,458 @@ final class PerfectFreehandGeometry {
             endCap.add(lastPoint.minus(direction.times(radius)));
         }
 
-        List<Point> outline = new ArrayList<>(
-                leftPoints.size() + endCap.size() + rightPoints.size() + startCap.size());
-        outline.addAll(leftPoints);
-        outline.addAll(endCap);
-        for (int i = rightPoints.size() - 1; i >= 0; i--) {
-            outline.add(rightPoints.get(i));
+        return new OutlineParts(leftPoints, rightPoints, startCap, endCap);
+    }
+
+    /**
+     * The four pieces {@code getStrokeOutlineParts} assembles into one outline: the left rail (in
+     * order), the right rail (in order -- callers assembling an outline must walk it backwards),
+     * and the start/end caps. Also used verbatim for the degenerate single-point "dot" case, with
+     * the dot itself stored in {@code left} and the other three empty, so {@link #assemble} still
+     * reproduces {@code getStrokeOutlinePoints}'s exact output.
+     */
+    static final class OutlineParts {
+        final List<Point> left;
+        final List<Point> right;
+        final List<Point> startCap;
+        final List<Point> endCap;
+
+        OutlineParts(List<Point> left, List<Point> right, List<Point> startCap, List<Point> endCap) {
+            this.left = left;
+            this.right = right;
+            this.startCap = startCap;
+            this.endCap = endCap;
         }
-        outline.addAll(startCap);
-        return outline;
+
+        static OutlineParts empty() {
+            return new OutlineParts(
+                    new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
+        }
+
+        List<Point> assemble() {
+            List<Point> outline =
+                    new ArrayList<>(left.size() + endCap.size() + right.size() + startCap.size());
+            outline.addAll(left);
+            outline.addAll(endCap);
+            for (int i = right.size() - 1; i >= 0; i--) {
+                outline.add(right.get(i));
+            }
+            outline.addAll(startCap);
+            return outline;
+        }
+    }
+
+    /**
+     * Stateful, append-only equivalent of {@link #getStroke} for exactly the options
+     * {@code SharedGeometryInkOverlay} draws with while a stroke is in progress:
+     * {@code isComplete=false}, both caps enabled, no taper (see the five-argument
+     * {@link #butterflyOptions}). Feed it one raw sample at a time via {@link #appendPoints} and
+     * draw only the returned tail fragment (never clearing) instead of recomputing and redrawing
+     * the whole outline every frame.
+     *
+     * <p>This is safe because, with those options, appending a point only ever changes two
+     * things: the outline entries already emitted (tentatively) for the previously-appended
+     * point -- finalized once this point supplies its real successor vector -- and the end cap.
+     * Every earlier point's entries are final the moment a successor exists and are never
+     * revisited. {@code PerfectFreehandGeometryParityTest} proves this by comparing this class's
+     * final {@link #leftPointsSnapshot} / {@link #rightPointsSnapshot} against a from-scratch
+     * {@link #getStrokeOutlineParts} call on the same points.
+     *
+     * <p>Two of the underlying algorithm's steps genuinely look ahead and so cannot be
+     * appended incrementally from the very first point: the streamline filter
+     * ({@link #getStrokePoints}) unconditionally flushes whatever the current last point is, and
+     * retroactively reconsiders that decision once a real successor arrives; and the
+     * pressure-simulation radius uses a warm-up average over the stroke's first up to 10 points,
+     * which keeps changing until that many exist. Both settle for good within a handful of
+     * points, so below {@link #SETTLE_STROKE_POINTS} stroke points this class simply redoes the
+     * (cheap, small-N) full computation on every call; a stroke that never reaches that many
+     * points just keeps paying that cheap cost for its whole (short) lifetime. From
+     * {@link #SETTLE_STROKE_POINTS} onward every further point is a true O(1) append.
+     */
+    static final class IncrementalOutline {
+        // Comfortably past both look-ahead windows for any stroke that is not essentially
+        // stationary: the pressure warm-up locks at 11 stroke points, and the streamline filter's
+        // minimum-length flush is, in practice, resolved within the first few.
+        private static final int SETTLE_STROKE_POINTS = 12;
+        private static final int OVERLAP = 2;
+
+        private final double size;
+        private final double thinning;
+        private final double smoothing;
+        private final double streamline;
+        private final double t;
+        private final double minDistance;
+
+        private final List<Point> rawPoints = new ArrayList<>();
+        private boolean settled;
+        private boolean simulatePressureDecision;
+
+        // getStrokePoints-layer resumable state (valid once settled).
+        private Point previousStrokePointPoint;
+        private double previousStrokePointRunningLength;
+
+        // getStrokeOutlinePoints-layer resumable state, as of the last CONFIRMED point.
+        private double previousPressure;
+        private Point previousVector;
+        private Point previousLeft;
+        private Point previousRight;
+        private boolean isPreviousPointSharpCorner;
+        private int pointIndex;
+        private double lastRadius;
+        private Point firstPointPoint;
+
+        private final List<Point> leftPoints = new ArrayList<>();
+        private final List<Point> rightPoints = new ArrayList<>();
+        private List<Point> startCap = new ArrayList<>();
+        private List<Point> endCap = new ArrayList<>();
+
+        // The most recently appended point's contribution: tentative until a real successor
+        // finalizes it (see appendSettledStrokePoint). Cleared/replaced, never both at once.
+        private boolean havePending;
+        private StrokePoint pendingPoint;
+        private int pendingLeftCount;
+        private int pendingRightCount;
+
+        // Snapshot of the confirmed running state as of just before `pendingPoint` was
+        // processed, so finalizing it can restore exactly that state and redo it for real.
+        private double confirmedPressure;
+        private Point confirmedVector;
+        private Point confirmedLeft;
+        private Point confirmedRight;
+        private boolean confirmedSharpCorner;
+        private int confirmedIndex;
+
+        IncrementalOutline(double size, double thinning, double smoothing, double streamline) {
+            this.size = size;
+            this.thinning = clamp(thinning, 0.0, 1.0);
+            this.smoothing = clamp(smoothing, 0.0, 1.0);
+            this.streamline = clamp(streamline, 0.1, 1.0);
+            this.t = 0.15 + (1.0 - this.streamline) * 0.85;
+            this.minDistance = Math.pow(size * this.smoothing, 2.0);
+        }
+
+        /** What changed by appending the given raw samples, and whether to clear first. */
+        static final class TailResult {
+            final List<Point> polygon;
+            final boolean clearFirst;
+
+            TailResult(List<Point> polygon, boolean clearFirst) {
+                this.polygon = polygon;
+                this.clearFirst = clearFirst;
+            }
+        }
+
+        TailResult appendPoints(List<Point> newPoints) {
+            if (newPoints.isEmpty()) return new TailResult(List.of(), false);
+            if (!settled) {
+                int consumed = 0;
+                List<Point> full = List.of();
+                for (; consumed < newPoints.size() && !settled; consumed++) {
+                    rawPoints.add(newPoints.get(consumed));
+                    full = recomputeUnsettled();
+                }
+                if (!settled) return new TailResult(full, true);
+                for (; consumed < newPoints.size(); consumed++) {
+                    appendOnePoint(newPoints.get(consumed));
+                }
+                return new TailResult(assembleFullOutline(), true);
+            }
+            int leftBoundary = leftPoints.size() - pendingLeftCount;
+            int rightBoundary = rightPoints.size() - pendingRightCount;
+            boolean anyChange = false;
+            for (Point raw : newPoints) {
+                if (appendOnePoint(raw)) anyChange = true;
+            }
+            return anyChange
+                    ? new TailResult(tailSince(leftBoundary, rightBoundary), false)
+                    : new TailResult(List.of(), false);
+        }
+
+        /**
+         * Speculative tail for a predicted (not yet real) sample: computed, then immediately
+         * rolled back, so it is drawn once and never affects the persistent outline state. Empty
+         * before the engine has a confirmed baseline to extend.
+         */
+        List<Point> predictTail(Point predicted) {
+            if (!settled || !havePending) return List.of();
+            int leftSize = leftPoints.size();
+            int rightSize = rightPoints.size();
+            Point savedStrokePoint = previousStrokePointPoint;
+            double savedRunningLength = previousStrokePointRunningLength;
+            double savedPressure = previousPressure, savedConfirmedPressure = confirmedPressure;
+            Point savedVector = previousVector, savedLeft = previousLeft, savedRight = previousRight;
+            Point savedConfirmedVector = confirmedVector, savedConfirmedLeft = confirmedLeft,
+                    savedConfirmedRight = confirmedRight;
+            boolean savedSharp = isPreviousPointSharpCorner, savedConfirmedSharp = confirmedSharpCorner;
+            int savedIndex = pointIndex, savedConfirmedIndex = confirmedIndex;
+            StrokePoint savedPending = pendingPoint;
+            int savedPendingLeft = pendingLeftCount, savedPendingRight = pendingRightCount;
+            List<Point> savedEndCap = endCap;
+            double savedRadius = lastRadius;
+
+            int leftBoundary = leftSize - pendingLeftCount;
+            int rightBoundary = rightSize - pendingRightCount;
+            List<Point> tail = appendOnePoint(predicted)
+                    ? tailSince(leftBoundary, rightBoundary)
+                    : List.of();
+
+            truncate(leftPoints, leftPoints.size() - leftSize);
+            truncate(rightPoints, rightPoints.size() - rightSize);
+            previousStrokePointPoint = savedStrokePoint;
+            previousStrokePointRunningLength = savedRunningLength;
+            previousPressure = savedPressure;
+            confirmedPressure = savedConfirmedPressure;
+            previousVector = savedVector;
+            previousLeft = savedLeft;
+            previousRight = savedRight;
+            confirmedVector = savedConfirmedVector;
+            confirmedLeft = savedConfirmedLeft;
+            confirmedRight = savedConfirmedRight;
+            isPreviousPointSharpCorner = savedSharp;
+            confirmedSharpCorner = savedConfirmedSharp;
+            pointIndex = savedIndex;
+            confirmedIndex = savedConfirmedIndex;
+            pendingPoint = savedPending;
+            pendingLeftCount = savedPendingLeft;
+            pendingRightCount = savedPendingRight;
+            endCap = savedEndCap;
+            lastRadius = savedRadius;
+            return tail;
+        }
+
+        /** Defensive-copy snapshots for parity testing against a from-scratch computation. */
+        List<Point> leftPointsSnapshot() { return new ArrayList<>(leftPoints); }
+        List<Point> rightPointsSnapshot() { return new ArrayList<>(rightPoints); }
+
+        /** The full current outline, exactly as {@code getStrokeOutlinePoints} would compute it
+         * from scratch on every raw point seen so far -- used for the multi-buffered (checkpoint
+         * and completion) draw, which wants the exact whole shape rather than a tail. */
+        List<Point> assembleFullOutline() {
+            List<Point> outline = new ArrayList<>(
+                    leftPoints.size() + endCap.size() + rightPoints.size() + startCap.size());
+            outline.addAll(leftPoints);
+            outline.addAll(endCap);
+            for (int i = rightPoints.size() - 1; i >= 0; i--) outline.add(rightPoints.get(i));
+            outline.addAll(startCap);
+            return outline;
+        }
+
+        private List<Point> recomputeUnsettled() {
+            boolean simulate = decideSimulatePressure(rawPoints);
+            Options candidate = butterflyOptions(size, thinning, smoothing, streamline, simulate);
+            List<StrokePoint> strokePoints = getStrokePoints(rawPoints, candidate);
+            if (strokePoints.size() < SETTLE_STROKE_POINTS) {
+                return getStrokeOutlinePoints(strokePoints, candidate, false);
+            }
+            settled = true;
+            simulatePressureDecision = simulate;
+            initializeSettledState(strokePoints);
+            for (StrokePoint sp : strokePoints) appendSettledStrokePoint(sp);
+            StrokePoint last = strokePoints.get(strokePoints.size() - 1);
+            previousStrokePointPoint = last.point;
+            previousStrokePointRunningLength = last.runningLength;
+            return assembleFullOutline();
+        }
+
+        private void initializeSettledState(List<StrokePoint> strokePoints) {
+            int pressureStartCount = Math.min(10, strokePoints.size() - 1);
+            double seed = strokePoints.get(0).pressure();
+            for (int i = 0; i < pressureStartCount; i++) {
+                StrokePoint current = strokePoints.get(i);
+                double pressure = simulatePressureDecision
+                        ? current.simulatePressure(seed, size)
+                        : current.pressure();
+                seed = (seed + pressure) / 2.0;
+            }
+            previousPressure = seed;
+            previousVector = strokePoints.get(0).vector;
+            previousLeft = strokePoints.get(0).point;
+            previousRight = previousLeft;
+            isPreviousPointSharpCorner = false;
+            pointIndex = 0;
+            firstPointPoint = strokePoints.get(0).point;
+        }
+
+        /** Returns whether {@code raw} produced a new stroke point (false = no visible change). */
+        private boolean appendOnePoint(Point raw) {
+            StrokePoint sp = nextStrokePoint(raw);
+            if (sp == null) return false;
+            appendSettledStrokePoint(sp);
+            return true;
+        }
+
+        private StrokePoint nextStrokePoint(Point raw) {
+            Point withPressure = raw.withPressure(raw.pressure == null ? 0.5 : raw.pressure);
+            Point candidate = previousStrokePointPoint.lerp(t, withPressure);
+            if (candidate.equalsIncludingPressure(previousStrokePointPoint)) return null;
+            double distance = candidate.distanceTo(previousStrokePointPoint);
+            double runningLength = previousStrokePointRunningLength + distance;
+            Point vector = candidate.unitVectorTo(previousStrokePointPoint);
+            // sourcePoints/sourceIndex only back updatePressure(), which this engine never calls
+            // (it never passes rememberSimulatedPressure=true); an empty list makes any accidental
+            // future call fail loudly instead of silently mutating an unrelated point.
+            StrokePoint sp = new StrokePoint(candidate, vector, distance, runningLength,
+                    List.of(), 0);
+            previousStrokePointPoint = candidate;
+            previousStrokePointRunningLength = runningLength;
+            return sp;
+        }
+
+        private void appendSettledStrokePoint(StrokePoint sp) {
+            if (havePending) {
+                truncate(leftPoints, pendingLeftCount);
+                truncate(rightPoints, pendingRightCount);
+                previousPressure = confirmedPressure;
+                previousVector = confirmedVector;
+                previousLeft = confirmedLeft;
+                previousRight = confirmedRight;
+                isPreviousPointSharpCorner = confirmedSharpCorner;
+                pointIndex = confirmedIndex;
+                boolean wasFirst = pointIndex == 0;
+                processPoint(pendingPoint, sp.vector, false);
+                if (wasFirst) computeStartCap();
+            }
+            confirmedPressure = previousPressure;
+            confirmedVector = previousVector;
+            confirmedLeft = previousLeft;
+            confirmedRight = previousRight;
+            confirmedSharpCorner = isPreviousPointSharpCorner;
+            confirmedIndex = pointIndex;
+            int leftBefore = leftPoints.size();
+            int rightBefore = rightPoints.size();
+            processPoint(sp, sp.vector, true);
+            pendingLeftCount = leftPoints.size() - leftBefore;
+            pendingRightCount = rightPoints.size() - rightBefore;
+            pendingPoint = sp;
+            havePending = true;
+            recomputeEndCap(sp);
+        }
+
+        /**
+         * One iteration of {@code getStrokeOutlineParts}'s per-point body, restricted to the
+         * app's fixed options (isComplete=false, so no taper and no early-continue; both caps
+         * enabled). {@code nextVector} is the successor's vector, or the point's own vector when
+         * it has no successor yet (mirrors {@code i == points.size() - 1} there).
+         */
+        private void processPoint(StrokePoint strokePoint, Point nextVector, boolean isLast) {
+            Point point = strokePoint.point;
+            Point vector = strokePoint.vector;
+            double radius;
+            if (thinning != 0.0) {
+                double pressure;
+                if (simulatePressureDecision) {
+                    pressure = strokePoint.simulatePressure(previousPressure, size);
+                    previousPressure = pressure;
+                } else {
+                    pressure = strokePoint.pressure();
+                }
+                radius = getStrokeRadius(size, thinning, pressure, IDENTITY_EASING);
+            } else {
+                radius = size / 2.0;
+            }
+            radius = Math.max(0.01, radius); // taper strength is always 1.0: no taper is enabled.
+            lastRadius = radius;
+
+            double nextDpr = vector.dot(nextVector);
+            double previousDpr = vector.dot(previousVector);
+            double maxDprForSharpCorner = size / 128.0;
+            boolean isPointSharpCorner =
+                    previousDpr < maxDprForSharpCorner && !isPreviousPointSharpCorner;
+            boolean isNextPointSharpCorner = nextDpr < maxDprForSharpCorner;
+
+            if (isPointSharpCorner || isNextPointSharpCorner) {
+                Point previousOffset = previousVector.perpendicular().times(radius);
+                for (double amount = 0.0; amount <= 1.0; amount += 1.0 / 13.0) {
+                    leftPoints.add(point.minus(previousOffset).rotAround(point, PI * amount));
+                    rightPoints.add(point.plus(previousOffset).rotAround(point, -PI * amount));
+                }
+                Point nextOffset = nextVector.perpendicular().times(radius);
+                Point temporaryLeft = point.plus(nextOffset).rotAround(point, -PI);
+                Point temporaryRight = point.minus(nextOffset).rotAround(point, PI);
+                leftPoints.add(temporaryLeft);
+                rightPoints.add(temporaryRight);
+                previousLeft = temporaryRight;
+                previousRight = temporaryLeft;
+                if (isNextPointSharpCorner) isPreviousPointSharpCorner = true;
+                pointIndex++;
+                return;
+            }
+
+            isPreviousPointSharpCorner = false;
+            if (isLast) {
+                Point offset = vector.perpendicular().times(radius);
+                leftPoints.add(point.minus(offset));
+                rightPoints.add(point.plus(offset));
+                pointIndex++;
+                return;
+            }
+
+            Point offset = nextVector.lerp(nextDpr, vector).perpendicular().times(radius);
+            Point temporaryLeft = point.minus(offset);
+            if (pointIndex <= 1 || previousLeft.distanceSquaredTo(temporaryLeft) > minDistance) {
+                leftPoints.add(temporaryLeft);
+                previousLeft = temporaryLeft;
+            }
+            Point temporaryRight = point.plus(offset);
+            if (pointIndex <= 1 || previousRight.distanceSquaredTo(temporaryRight) > minDistance) {
+                rightPoints.add(temporaryRight);
+                previousRight = temporaryRight;
+            }
+            previousVector = vector;
+            pointIndex++;
+        }
+
+        private void computeStartCap() {
+            // options.start.cap is always true for the app's fixed options (see the 5-arg
+            // butterflyOptions), and taper is always disabled.
+            List<Point> cap = new ArrayList<>();
+            Point right0 = rightPoints.get(0);
+            for (double amount = 1.0 / 13.0; amount <= 1.0; amount += 1.0 / 13.0) {
+                cap.add(right0.rotAround(firstPointPoint, PI * amount));
+            }
+            startCap = cap;
+        }
+
+        private void recomputeEndCap(StrokePoint last) {
+            // options.end.cap is always true for the app's fixed options; taper always disabled.
+            Point direction = last.vector.negated().perpendicular();
+            Point start = last.point.project(direction, lastRadius);
+            List<Point> cap = new ArrayList<>();
+            for (double amount = 1.0 / 29.0; amount <= 1.0; amount += 1.0 / 29.0) {
+                cap.add(start.rotAround(last.point, PI * 3.0 * amount));
+            }
+            endCap = cap;
+        }
+
+        /**
+         * The fragment that changed since {@code leftBoundary}/{@code rightBoundary} (the
+         * confirmed rail lengths before this call), padded by {@link #OVERLAP} already-drawn
+         * points on each side so the new fill shares an edge with -- rather than merely touches --
+         * what is already on the front buffer, hiding any antialiasing seam between them.
+         */
+        private List<Point> tailSince(int leftBoundary, int rightBoundary) {
+            List<Point> tail = new ArrayList<>();
+            int leftFrom = Math.max(0, leftBoundary - OVERLAP);
+            for (int i = leftFrom; i < leftPoints.size(); i++) tail.add(leftPoints.get(i));
+            tail.addAll(endCap);
+            int rightFrom = Math.max(0, rightBoundary - OVERLAP);
+            for (int i = rightPoints.size() - 1; i >= rightFrom; i--) tail.add(rightPoints.get(i));
+            return tail;
+        }
+
+        private static void truncate(List<Point> list, int count) {
+            if (count > 0) list.subList(list.size() - count, list.size()).clear();
+        }
+
+        /** Mirrors PenRenderer.shouldSimulatePressure() in Butterfly's Dart source. */
+        private static boolean decideSimulatePressure(List<Point> points) {
+            if (points.size() < 2) return true;
+            double reference = points.get(1).pressure;
+            for (int i = 2; i < points.size(); i++) {
+                if (points.get(i).pressure != reference) return false;
+            }
+            return true;
+        }
     }
 
     /** Equivalent to perfect_freehand's {@code getStrokeRadius}. */
