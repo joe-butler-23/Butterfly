@@ -110,7 +110,7 @@ class MainViewViewportState extends State<MainViewViewport>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     if (nativeInkLabEnabled) {
-      _nativeInk?.disarm();
+      _nativeInk?.disarm(notifyNative: false);
       unawaited(_nativeInk?.dispose());
     }
     _input.dispose();
@@ -140,7 +140,7 @@ class MainViewViewportState extends State<MainViewViewport>
         return;
       }
       _nativeInkLifecycleActive = false;
-      _nativeInk?.disarm();
+      _nativeInk?.disarm(notifyNative: false);
       _nativeInkTeardown = _nativeInk?.disable();
     } else if (state == AppLifecycleState.resumed) {
       return;

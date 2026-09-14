@@ -201,6 +201,23 @@ class _Handoff {
     return true;
   }
 
+  // Cancel any pending final older than the immediately previous stroke,
+  // keeping at most one unacknowledged final behind the newest stroke. Never
+  // touches the newest two entries (the just-registered stroke and the one
+  // before it), so a fast second stroke can't cause a visible gap while the
+  // previous stroke's ack round trip is still in flight.
+  List<_Registration> cancelStaleFinals() {
+    if (_ordered.length < 3) return const [];
+    final stale = <_Stroke>[
+      for (var i = 0; i < _ordered.length - 2; i++)
+        if (_ordered[i].finalElementId != null) _ordered[i],
+    ];
+    for (final stroke in stale) {
+      _remove(stroke);
+    }
+    return stale.map((stroke) => stroke.registration).toList(growable: false);
+  }
+
   List<Map<String, Object>> painted(
     Iterable<({String elementId, int? pointCount})> receipts,
   ) {
@@ -296,8 +313,9 @@ class NativeInkBridge {
   int _controlEpoch = 0;
   int _activationTicket = 0;
   bool _activationInFlight = false;
-  bool _failureBlocked = false;
   bool _retireForegrounds = false;
+  int _consecutiveFailures = 0;
+  static const _maxConsecutiveFailures = 3;
   NativeInkState? _failedState;
   NativeInkState? _state;
   ({
@@ -329,13 +347,13 @@ class NativeInkBridge {
       final generation = call.arguments;
       if (generation is int && _state?.generation == generation) {
         _failedState = _state;
+        _consecutiveFailures++;
         _controlEpoch++;
         _enabled = false;
         _activationInFlight = false;
         _pendingFrameCallback = null;
         _state = null;
         _clearHandoff();
-        _failureBlocked = true;
       }
       return null;
     }
@@ -420,20 +438,19 @@ class NativeInkBridge {
       streamline: property.streamline,
       pressurePolicy: settings.ignorePressure,
     );
-    if (_failureBlocked) {
-      final failed = _failedState;
-      if (failed == null ||
-          _sameConfiguration(
-            failed,
-            brush,
-            geometry,
-            canvasBounds,
-            devicePixelRatio,
-          )) {
+    final failed = _failedState;
+    if (failed != null) {
+      if (_sameConfiguration(
+        failed,
+        brush,
+        geometry,
+        canvasBounds,
+        devicePixelRatio,
+      )) {
         return null;
       }
-      _failureBlocked = false;
       _failedState = null;
+      _consecutiveFailures = 0;
     }
     final previous = _state;
     if (previous != null &&
@@ -510,7 +527,6 @@ class NativeInkBridge {
 
   void disarm({bool notifyNative = true}) {
     final generation = _state?.generation;
-    _failureBlocked = false;
     _failedState = null;
     _controlEpoch++;
     _enabled = false;
@@ -531,6 +547,12 @@ class NativeInkBridge {
   }
 
   NativeInkStrokeIdentity? registerStroke(PointerDownEvent event) {
+    // Re-arm per stroke: a transient failure only blocks the stroke that
+    // was active when it happened, unless failures keep recurring with no
+    // successful stroke in between.
+    if (_failedState != null && _consecutiveFailures < _maxConsecutiveFailures) {
+      _failedState = null;
+    }
     final state = _state;
     if (_disposed || !_available || !_enabled || state == null) return null;
     final registration = _handoff.register(
@@ -539,6 +561,15 @@ class NativeInkBridge {
       sourceTimestampUs: event.timeStamp.inMicroseconds,
     );
     _flushRetired();
+    // Keep at most one pending (unacknowledged) final behind the newest
+    // stroke; anything older is gap-safe to cancel now.
+    final staleFinals = _handoff.cancelStaleFinals();
+    if (staleFinals.isNotEmpty) {
+      _retireForegrounds = true;
+      for (final stale in staleFinals) {
+        unawaited(_invoke<void>('cancelStroke', stale.toMap()));
+      }
+    }
     if (_handoff.overflowed) {
       unawaited(disable());
       return null;
@@ -571,7 +602,9 @@ class NativeInkBridge {
   ) {
     _retireForegrounds = false;
     if (!_enabled) return;
-    for (final acknowledgement in _handoff.painted(receipts)) {
+    final acknowledgements = _handoff.painted(receipts);
+    if (acknowledgements.isNotEmpty) _consecutiveFailures = 0;
+    for (final acknowledgement in acknowledgements) {
       unawaited(_invoke<void>('acknowledgeStroke', acknowledgement));
     }
   }

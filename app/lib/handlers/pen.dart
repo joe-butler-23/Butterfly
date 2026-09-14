@@ -196,8 +196,17 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     CameraViewport currentViewport,
     CameraViewport newViewport,
   ) async {
-    if (_submittedElements.isEmpty || nativeInkLabEnabled) return;
-    final submittedIds = _submittedElements.map((e) => e.id).nonNulls.toSet();
+    if (_submittedElements.isEmpty) return;
+    // Native-owned elements are retired only via a paint acknowledgement or
+    // an explicit cancel; this safety net only ever sweeps Flutter-owned
+    // ones, so a missed native ack can't be papered over by clearing an
+    // element native still expects to acknowledge.
+    final flutterOwnedIds = _submittedElements
+        .map((e) => e.id)
+        .nonNulls
+        .where((id) => !_nativeOwnedElementIds.contains(id))
+        .toSet();
+    if (flutterOwnedIds.isEmpty) return;
     final viewportIds = [
       ...newViewport.bakedElements,
       ...newViewport.unbakedElements,
@@ -206,8 +215,10 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     // preview to the document. A rapid sequence can produce an intermediate
     // viewport containing only some submitted strokes; clearing all previews
     // then makes the remaining strokes disappear until their events finish.
-    if (submittedIds.intersection(viewportIds).isNotEmpty) return;
-    _submittedElements.clear();
+    if (flutterOwnedIds.intersection(viewportIds).isNotEmpty) return;
+    _submittedElements.removeWhere(
+      (element) => !_nativeOwnedElementIds.contains(element.id),
+    );
     await _bloc?.refresh(allowBake: false);
     // If already started a new element, we don't bake yet
     if (elements.isEmpty) {
