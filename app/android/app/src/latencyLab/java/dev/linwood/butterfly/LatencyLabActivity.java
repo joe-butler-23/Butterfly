@@ -175,11 +175,12 @@ public final class LatencyLabActivity extends MainActivity {
 
     @Override public boolean dispatchTouchEvent(MotionEvent event) {
         StylusWetInkRenderer renderer = wetInk;
+        long rendererGeneration = configuredGeneration;
         if (renderer != null) {
             try {
                 renderer.onMotionEvent(event);
             } catch (RuntimeException | LinkageError error) {
-                destroyWetInk();
+                onRendererFailure(renderer, rendererGeneration);
             }
         }
         return super.dispatchTouchEvent(event);
