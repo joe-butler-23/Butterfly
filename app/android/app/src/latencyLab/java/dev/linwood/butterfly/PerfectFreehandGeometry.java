@@ -6,16 +6,16 @@ import android.graphics.RectF;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.function.DoubleUnaryOperator;
 
 /**
- * Dependency-free port of {@code perfect_freehand} 2.5.2+1's geometry.
- *
- * <p>The port intentionally keeps all geometry and pressure calculations as {@code double}. Only
- * the final Android {@link Path} calls narrow values to {@code float}, as required by Android's
- * Path API. It mirrors Butterfly's Dart call boundary: thinning and smoothing are limited to
- * [0, 1], streamline is limited to [0.1, 1], and physical size and points are supplied by the
- * caller after any device-pixel-ratio scaling.
+ * Dependency-free port of {@code perfect_freehand} 2.5.2+1's geometry, restricted to the exact
+ * options Butterfly's {@code PenRenderer} ever calls it with: {@code isComplete=false}, both
+ * caps enabled, no taper, identity easing (see {@link #butterflyOptions}). The port intentionally
+ * keeps all geometry and pressure calculations as {@code double}. Only the final Android
+ * {@link Path} calls narrow values to {@code float}, as required by Android's Path API. It
+ * mirrors Butterfly's Dart call boundary: thinning and smoothing are limited to [0, 1],
+ * streamline is limited to [0.1, 1], and physical size and points are supplied by the caller
+ * after any device-pixel-ratio scaling.
  *
  * <p>Upstream source: https://pub.dev/packages/perfect_freehand/versions/2.5.2+1
  *
@@ -47,18 +47,15 @@ import java.util.function.DoubleUnaryOperator;
 final class PerfectFreehandGeometry {
     private static final double RATE_OF_PRESSURE_CHANGE = 0.275;
     private static final double PI = Math.PI;
-    private static final DoubleUnaryOperator IDENTITY_EASING = t -> t;
-    private static final DoubleUnaryOperator START_EASING = t -> t * (2.0 - t);
-    private static final DoubleUnaryOperator END_EASING = t -> {
-        double value = t - 1.0;
-        return value * value * value + 1.0;
-    };
 
     private PerfectFreehandGeometry() {}
 
     /**
-     * Applies the same option limits as {@code PenRenderer._getOutlinePoints} in Butterfly Dart.
-     * Size is already in physical pixels at this boundary and is intentionally not clamped.
+     * Butterfly's fixed call-boundary options: the same limits as {@code
+     * PenRenderer._getOutlinePoints} in Butterfly Dart, plus perfect_freehand's own defaults for
+     * everything Butterfly never overrides (isComplete false, both caps enabled, no taper,
+     * identity easing). Size is already in physical pixels at this boundary and is intentionally
+     * not clamped.
      */
     static Options butterflyOptions(
             double size,
@@ -66,56 +63,17 @@ final class PerfectFreehandGeometry {
             double smoothing,
             double streamline,
             boolean simulatePressure) {
-        return butterflyOptions(
-                size,
-                thinning,
-                smoothing,
-                streamline,
-                simulatePressure,
-                false,
-                true,
-                true,
-                null,
-                null);
-    }
-
-    /**
-     * Butterfly call-boundary options with the complete/cap/taper controls needed for parity
-     * fixtures. A taper is already in physical pixels; {@code -1} remains the upstream sentinel.
-     */
-    static Options butterflyOptions(
-            double size,
-            double thinning,
-            double smoothing,
-            double streamline,
-            boolean simulatePressure,
-            boolean isComplete,
-            boolean startCap,
-            boolean endCap,
-            Double startTaper,
-            Double endTaper) {
         return new Options(
                 size,
                 clamp(thinning, 0.0, 1.0),
                 clamp(smoothing, 0.0, 1.0),
                 clamp(streamline, 0.1, 1.0),
-                IDENTITY_EASING,
-                simulatePressure,
-                EndOptions.start(startCap, false, startTaper),
-                EndOptions.end(endCap, false, endTaper),
-                isComplete);
+                simulatePressure);
     }
 
     /** Equivalent to perfect_freehand's {@code getStroke}. */
     static List<Point> getStroke(List<Point> points, Options options) {
-        return getStroke(points, options, false);
-    }
-
-    /** Equivalent to perfect_freehand's {@code getStroke(... rememberSimulatedPressure: ...)}. */
-    static List<Point> getStroke(
-            List<Point> points, Options options, boolean rememberSimulatedPressure) {
-        return getStrokeOutlinePoints(
-                getStrokePoints(points, options), options, rememberSimulatedPressure);
+        return getStrokeOutlineParts(getStrokePoints(points, options), options).assemble();
     }
 
     /** Equivalent to perfect_freehand's {@code getStrokePoints}. */
@@ -148,13 +106,7 @@ final class PerfectFreehandGeometry {
         }
 
         List<StrokePoint> strokePoints = new ArrayList<>(pts.size());
-        StrokePoint first = new StrokePoint(
-                pts.get(0),
-                new Point(1.0, 1.0, null),
-                0.0,
-                0.0,
-                points,
-                0);
+        StrokePoint first = new StrokePoint(pts.get(0), new Point(1.0, 1.0, null), 0.0, 0.0);
         strokePoints.add(first);
 
         boolean hasReachedMinimumLength = false;
@@ -163,9 +115,7 @@ final class PerfectFreehandGeometry {
         int max = pts.size() - 1;
 
         for (int i = 0; i < pts.size(); i++) {
-            Point point = options.isComplete && i == max
-                    ? pts.get(i)
-                    : previous.point.lerp(t, pts.get(i));
+            Point point = previous.point.lerp(t, pts.get(i));
             if (point.equalsIncludingPressure(previous.point)) {
                 continue;
             }
@@ -180,12 +130,7 @@ final class PerfectFreehandGeometry {
             }
 
             previous = new StrokePoint(
-                    point,
-                    point.unitVectorTo(previous.point),
-                    distance,
-                    runningLength,
-                    points,
-                    Math.min(i, points.size() - 1));
+                    point, point.unitVectorTo(previous.point), distance, runningLength);
             strokePoints.add(previous);
         }
 
@@ -198,226 +143,28 @@ final class PerfectFreehandGeometry {
     }
 
     /**
-     * Equivalent to perfect_freehand's {@code getStrokeOutlinePoints}, including optional storage
-     * of simulated pressures back into the caller's mutable point list.
+     * Same computation as {@code getStroke}, but returns the left/right rails and both caps
+     * separately instead of the assembled outline: {@code PerfectFreehandGeometryParityTest}
+     * uses this to prove {@link IncrementalOutline}'s own rails, built up one append at a time,
+     * equal a from-scratch computation exactly. Delegates to a throwaway
+     * {@code IncrementalOutline}, replayed over the already-known {@code points}, so the batch
+     * case and the truly incremental, append-only case share one implementation of the
+     * per-point outline step instead of each carrying its own copy.
      */
-    static List<Point> getStrokeOutlinePoints(
-            List<StrokePoint> points, Options options, boolean rememberSimulatedPressure) {
-        return getStrokeOutlineParts(points, options, rememberSimulatedPressure).assemble();
-    }
-
-    /**
-     * Same computation as {@link #getStrokeOutlinePoints}, but returns the left/right rails and
-     * both caps separately instead of the assembled outline. {@link IncrementalOutline} keeps the
-     * same four pieces incrementally; exposing them here lets a test prove the two agree exactly
-     * (see {@code PerfectFreehandGeometryParityTest}) instead of only comparing the final,
-     * already-concatenated outline.
-     */
-    static OutlineParts getStrokeOutlineParts(
-            List<StrokePoint> points, Options options, boolean rememberSimulatedPressure) {
-        if (rememberSimulatedPressure && (!options.simulatePressure || !options.isComplete)) {
-            throw new IllegalArgumentException(
-                    "rememberSimulatedPressure requires simulated pressure and a complete stroke");
-        }
+    static OutlineParts getStrokeOutlineParts(List<StrokePoint> points, Options options) {
         if (points.isEmpty() || options.size <= 0.0) {
             return OutlineParts.empty();
         }
-
-        double totalLength = points.get(points.size() - 1).runningLength;
-        double taperStart = options.start.taperEnabled
-                ? (options.start.customTaper == null
-                        ? Math.max(options.size, totalLength)
-                        : options.start.customTaper)
-                : 0.0;
-        double taperEnd = options.end.taperEnabled
-                ? (options.end.customTaper == null
-                        ? Math.max(options.size, totalLength)
-                        : options.end.customTaper)
-                : 0.0;
-        double minDistance = Math.pow(options.size * options.smoothing, 2.0);
-
-        List<Point> leftPoints = new ArrayList<>();
-        List<Point> rightPoints = new ArrayList<>();
-
-        double previousPressure = points.get(0).pressure();
-        int pressureStartCount = Math.min(10, points.size() - 1);
-        for (int i = 0; i < pressureStartCount; i++) {
-            StrokePoint current = points.get(i);
-            double pressure = options.simulatePressure
-                    ? current.simulatePressure(previousPressure, options.size)
-                    : current.pressure();
-            previousPressure = (previousPressure + pressure) / 2.0;
-        }
-
-        double radius = getStrokeRadius(
-                options.size,
-                options.thinning,
-                points.get(points.size() - 1).pressure(),
-                options.easing);
-        Double firstRadius = null;
-        Point previousVector = points.get(0).vector;
-        Point previousLeft = points.get(0).point;
-        Point previousRight = previousLeft;
-        Point temporaryLeft = previousLeft;
-        Point temporaryRight = previousRight;
-        boolean isPreviousPointSharpCorner = false;
-
-        for (int i = 0; i < points.size(); i++) {
-            StrokePoint strokePoint = points.get(i);
-            Point point = strokePoint.point;
-            Point vector = strokePoint.vector;
-            double runningLength = strokePoint.runningLength;
-
-            if (i < points.size() - 1
-                    && options.isComplete
-                    && !isPreviousPointSharpCorner
-                    && totalLength - runningLength < options.size / 2.0) {
-                continue;
-            }
-
-            if (options.thinning != 0.0) {
-                double pressure;
-                if (options.simulatePressure) {
-                    pressure = strokePoint.simulatePressure(previousPressure, options.size);
-                    if (rememberSimulatedPressure) {
-                        strokePoint.updatePressure(pressure);
-                    }
-                    previousPressure = pressure;
-                } else {
-                    pressure = strokePoint.pressure();
-                }
-                radius = getStrokeRadius(options.size, options.thinning, pressure, options.easing);
-            } else {
-                radius = options.size / 2.0;
-            }
-
-            if (firstRadius == null) {
-                firstRadius = radius;
-            }
-
-            double taperStartStrength = runningLength < taperStart
-                    ? options.start.easing.applyAsDouble(runningLength / taperStart)
-                    : 1.0;
-            double taperEndStrength = totalLength - runningLength < taperEnd
-                    ? options.end.easing.applyAsDouble((totalLength - runningLength) / taperEnd)
-                    : 1.0;
-            radius = Math.max(0.01, radius * Math.min(taperStartStrength, taperEndStrength));
-
-            Point nextVector = i < points.size() - 1 ? points.get(i + 1).vector : vector;
-            double nextDpr = i < points.size() - 1 ? vector.dot(nextVector) : 1.0;
-            double previousDpr = vector.dot(previousVector);
-            double maxDprForSharpCorner = options.size / 128.0;
-            boolean isPointSharpCorner = previousDpr < maxDprForSharpCorner
-                    && !isPreviousPointSharpCorner;
-            boolean isNextPointSharpCorner = nextDpr < maxDprForSharpCorner;
-
-            if (isPointSharpCorner || isNextPointSharpCorner) {
-                Point previousOffset = previousVector.perpendicular().times(radius);
-                double step = 1.0 / 13.0;
-                for (double amount = 0.0; amount <= 1.0; amount += step) {
-                    temporaryLeft = point.minus(previousOffset).rotAround(point, PI * amount);
-                    leftPoints.add(temporaryLeft);
-                    temporaryRight = point.plus(previousOffset).rotAround(point, -PI * amount);
-                    rightPoints.add(temporaryRight);
-                }
-
-                Point nextOffset = nextVector.perpendicular().times(radius);
-                temporaryLeft = point.plus(nextOffset).rotAround(point, -PI);
-                temporaryRight = point.minus(nextOffset).rotAround(point, PI);
-                leftPoints.add(temporaryLeft);
-                rightPoints.add(temporaryRight);
-                previousLeft = temporaryRight;
-                previousRight = temporaryLeft;
-                if (isNextPointSharpCorner) {
-                    isPreviousPointSharpCorner = true;
-                }
-                continue;
-            }
-
-            isPreviousPointSharpCorner = false;
-            if (i == points.size() - 1) {
-                Point offset = vector.perpendicular().times(radius);
-                leftPoints.add(point.minus(offset));
-                rightPoints.add(point.plus(offset));
-                continue;
-            }
-
-            Point offset = nextVector.lerp(nextDpr, vector).perpendicular().times(radius);
-            temporaryLeft = point.minus(offset);
-            if (i <= 1 || previousLeft.distanceSquaredTo(temporaryLeft) > minDistance) {
-                leftPoints.add(temporaryLeft);
-                previousLeft = temporaryLeft;
-            }
-            temporaryRight = point.plus(offset);
-            if (i <= 1 || previousRight.distanceSquaredTo(temporaryRight) > minDistance) {
-                rightPoints.add(temporaryRight);
-                previousRight = temporaryRight;
-            }
-            previousVector = vector;
-        }
-
-        Point firstPoint = points.get(0).point;
-        Point lastPoint = points.size() > 1
-                ? points.get(points.size() - 1).point
-                : firstPoint.plus(points.get(0).vector);
-        List<Point> startCap = new ArrayList<>();
-        List<Point> endCap = new ArrayList<>();
-
-        if (points.size() == 1) {
-            if (!(taperStart > 0.0 || taperEnd > 0.0) || options.isComplete) {
-                Point start = firstPoint.project(
-                        firstPoint.minus(lastPoint).perpendicular().unit(),
-                        -(firstRadius == null ? radius : firstRadius));
-                List<Point> dotPoints = new ArrayList<>();
-                double step = 1.0 / 13.0;
-                for (double amount = step; amount <= 1.0; amount += step) {
-                    dotPoints.add(start.rotAround(firstPoint, PI * 2.0 * amount));
-                }
-                return new OutlineParts(
-                        dotPoints, new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
-            }
-        } else if (taperStart > 0.0 || (taperEnd > 0.0 && points.size() == 1)) {
-            // Tapered start: no cap.
-        } else if (options.start.cap) {
-            double step = 1.0 / 13.0;
-            for (double amount = step; amount <= 1.0; amount += step) {
-                startCap.add(rightPoints.get(0).rotAround(firstPoint, PI * amount));
-            }
-        } else {
-            Point cornersVector = leftPoints.get(0).minus(rightPoints.get(0));
-            Point offsetA = cornersVector.times(0.5);
-            Point offsetB = cornersVector.times(0.51);
-            startCap.add(firstPoint.minus(offsetA));
-            startCap.add(firstPoint.minus(offsetB));
-            startCap.add(firstPoint.plus(offsetB));
-            startCap.add(firstPoint.plus(offsetA));
-        }
-
-        Point direction = points.get(points.size() - 1).vector.negated().perpendicular();
-        if (taperEnd > 0.0 || (taperStart > 0.0 && points.size() == 1)) {
-            endCap.add(lastPoint);
-        } else if (options.end.cap) {
-            Point start = lastPoint.project(direction, radius);
-            double step = 1.0 / 29.0;
-            for (double amount = step; amount <= 1.0; amount += step) {
-                endCap.add(start.rotAround(lastPoint, PI * 3.0 * amount));
-            }
-        } else {
-            endCap.add(lastPoint.plus(direction.times(radius)));
-            endCap.add(lastPoint.plus(direction.times(radius * 0.99)));
-            endCap.add(lastPoint.minus(direction.times(radius * 0.99)));
-            endCap.add(lastPoint.minus(direction.times(radius)));
-        }
-
-        return new OutlineParts(leftPoints, rightPoints, startCap, endCap);
+        IncrementalOutline engine = new IncrementalOutline(
+                options.size, options.thinning, options.smoothing, options.streamline);
+        engine.replay(points, options.simulatePressure);
+        return new OutlineParts(engine.leftPoints, engine.rightPoints, engine.startCap, engine.endCap);
     }
 
     /**
-     * The four pieces {@code getStrokeOutlineParts} assembles into one outline: the left rail (in
-     * order), the right rail (in order -- callers assembling an outline must walk it backwards),
-     * and the start/end caps. Also used verbatim for the degenerate single-point "dot" case, with
-     * the dot itself stored in {@code left} and the other three empty, so {@link #assemble} still
-     * reproduces {@code getStrokeOutlinePoints}'s exact output.
+     * The four pieces {@code getStroke} assembles into one outline: the left rail (in order),
+     * the right rail (in order -- callers assembling an outline must walk it backwards), and the
+     * start/end caps.
      */
     static final class OutlineParts {
         final List<Point> left;
@@ -451,12 +198,16 @@ final class PerfectFreehandGeometry {
     }
 
     /**
-     * Stateful, append-only equivalent of {@link #getStroke} for exactly the options
+     * Stateful, append-only engine that is the single implementation of perfect_freehand's
+     * per-point outline step ({@link #processPoint}), for exactly the options
      * {@code SharedGeometryInkOverlay} draws with while a stroke is in progress:
-     * {@code isComplete=false}, both caps enabled, no taper (see the five-argument
-     * {@link #butterflyOptions}). Feed it one raw sample at a time via {@link #appendPoints} and
-     * draw only the returned tail fragment (never clearing) instead of recomputing and redrawing
-     * the whole outline every frame.
+     * {@code isComplete=false}, both caps enabled, no taper (see {@link #butterflyOptions}).
+     * {@link #getStrokeOutlineParts} drives the same engine, replayed over an already-known
+     * point sequence, for the batch case -- so there is only ever one copy of the per-point body
+     * rather than a separate one for streaming and one for batch computation. Production feeds
+     * this engine one raw sample at a time via {@link #appendPoints} and draws only the returned
+     * tail fragment (never clearing) instead of recomputing and redrawing the whole outline every
+     * frame.
      *
      * <p>This is safe because, with those options, appending a point only ever changes two
      * things: the outline entries already emitted (tentatively) for the previously-appended
@@ -472,9 +223,10 @@ final class PerfectFreehandGeometry {
      * retroactively reconsiders that decision once a real successor arrives; and the
      * pressure-simulation radius uses a warm-up average over the stroke's first up to 10 points,
      * which keeps changing until that many exist. Both settle for good within a handful of
-     * points, so below {@link #SETTLE_STROKE_POINTS} stroke points this class simply redoes the
-     * (cheap, small-N) full computation on every call; a stroke that never reaches that many
-     * points just keeps paying that cheap cost for its whole (short) lifetime. From
+     * points, so below {@link #SETTLE_STROKE_POINTS} stroke points this class resets and replays
+     * its own per-point step over the (cheap, small-N) full recomputation on every call, rather
+     * than calling a separate batch function; a stroke that never reaches that many points just
+     * keeps paying that cheap cost for its whole (short) lifetime. From
      * {@link #SETTLE_STROKE_POINTS} onward every further point is a true O(1) append.
      */
     static final class IncrementalOutline {
@@ -499,7 +251,7 @@ final class PerfectFreehandGeometry {
         private Point previousStrokePointPoint;
         private double previousStrokePointRunningLength;
 
-        // getStrokeOutlinePoints-layer resumable state, as of the last CONFIRMED point.
+        // getStroke-layer resumable state, as of the last CONFIRMED point.
         private double previousPressure;
         private Point previousVector;
         private Point previousLeft;
@@ -632,9 +384,9 @@ final class PerfectFreehandGeometry {
         List<Point> leftPointsSnapshot() { return new ArrayList<>(leftPoints); }
         List<Point> rightPointsSnapshot() { return new ArrayList<>(rightPoints); }
 
-        /** The full current outline, exactly as {@code getStrokeOutlinePoints} would compute it
-         * from scratch on every raw point seen so far -- used for the multi-buffered (checkpoint
-         * and completion) draw, which wants the exact whole shape rather than a tail. */
+        /** The full current outline, exactly as {@code getStroke} would compute it from scratch
+         * on every raw point seen so far -- used for the multi-buffered (checkpoint and
+         * completion) draw, which wants the exact whole shape rather than a tail. */
         List<Point> assembleFullOutline() {
             List<Point> outline = new ArrayList<>(
                     leftPoints.size() + endCap.size() + rightPoints.size() + startCap.size());
@@ -647,19 +399,42 @@ final class PerfectFreehandGeometry {
 
         private List<Point> recomputeUnsettled() {
             boolean simulate = decideSimulatePressure(rawPoints);
-            Options candidate = butterflyOptions(size, thinning, smoothing, streamline, simulate);
-            List<StrokePoint> strokePoints = getStrokePoints(rawPoints, candidate);
-            if (strokePoints.size() < SETTLE_STROKE_POINTS) {
-                return getStrokeOutlinePoints(strokePoints, candidate, false);
+            List<StrokePoint> strokePoints = getStrokePoints(
+                    rawPoints, butterflyOptions(size, thinning, smoothing, streamline, simulate));
+            replay(strokePoints, simulate);
+            if (strokePoints.size() >= SETTLE_STROKE_POINTS) {
+                settled = true;
+                StrokePoint last = strokePoints.get(strokePoints.size() - 1);
+                previousStrokePointPoint = last.point;
+                previousStrokePointRunningLength = last.runningLength;
             }
-            settled = true;
-            simulatePressureDecision = simulate;
+            return assembleFullOutline();
+        }
+
+        /**
+         * Resets this engine's rails/caps and replays its per-point step ({@link #processPoint},
+         * via {@link #appendSettledStrokePoint}) over an already-known stroke-point sequence with
+         * a known simulate-pressure decision. Used both for the warm-up preview above (a small
+         * full recompute on every call, below {@link #SETTLE_STROKE_POINTS}) and by
+         * {@link PerfectFreehandGeometry#getStrokeOutlineParts}'s batch case -- so neither
+         * duplicates the streaming append path's per-point body.
+         */
+        private void replay(List<StrokePoint> strokePoints, boolean simulatePressure) {
+            resetRails();
+            simulatePressureDecision = simulatePressure;
+            if (strokePoints.isEmpty()) return;
             initializeSettledState(strokePoints);
             for (StrokePoint sp : strokePoints) appendSettledStrokePoint(sp);
-            StrokePoint last = strokePoints.get(strokePoints.size() - 1);
-            previousStrokePointPoint = last.point;
-            previousStrokePointRunningLength = last.runningLength;
-            return assembleFullOutline();
+        }
+
+        private void resetRails() {
+            leftPoints.clear();
+            rightPoints.clear();
+            startCap.clear();
+            endCap.clear();
+            havePending = false;
+            pendingLeftCount = 0;
+            pendingRightCount = 0;
         }
 
         private void initializeSettledState(List<StrokePoint> strokePoints) {
@@ -696,11 +471,7 @@ final class PerfectFreehandGeometry {
             double distance = candidate.distanceTo(previousStrokePointPoint);
             double runningLength = previousStrokePointRunningLength + distance;
             Point vector = candidate.unitVectorTo(previousStrokePointPoint);
-            // sourcePoints/sourceIndex only back updatePressure(), which this engine never calls
-            // (it never passes rememberSimulatedPressure=true); an empty list makes any accidental
-            // future call fail loudly instead of silently mutating an unrelated point.
-            StrokePoint sp = new StrokePoint(candidate, vector, distance, runningLength,
-                    List.of(), 0);
+            StrokePoint sp = new StrokePoint(candidate, vector, distance, runningLength);
             previousStrokePointPoint = candidate;
             previousStrokePointRunningLength = runningLength;
             return sp;
@@ -737,10 +508,10 @@ final class PerfectFreehandGeometry {
         }
 
         /**
-         * One iteration of {@code getStrokeOutlineParts}'s per-point body, restricted to the
-         * app's fixed options (isComplete=false, so no taper and no early-continue; both caps
+         * The single implementation of perfect_freehand's per-point outline step, restricted to
+         * the app's fixed options (isComplete=false, so no taper and no early-continue; both caps
          * enabled). {@code nextVector} is the successor's vector, or the point's own vector when
-         * it has no successor yet (mirrors {@code i == points.size() - 1} there).
+         * it has no successor yet (mirrors the last-point case of the upstream algorithm).
          */
         private void processPoint(StrokePoint strokePoint, Point nextVector, boolean isLast) {
             Point point = strokePoint.point;
@@ -754,7 +525,7 @@ final class PerfectFreehandGeometry {
                 } else {
                     pressure = strokePoint.pressure();
                 }
-                radius = getStrokeRadius(size, thinning, pressure, IDENTITY_EASING);
+                radius = getStrokeRadius(size, thinning, pressure);
             } else {
                 radius = size / 2.0;
             }
@@ -811,7 +582,7 @@ final class PerfectFreehandGeometry {
         }
 
         private void computeStartCap() {
-            // options.start.cap is always true for the app's fixed options (see the 5-arg
+            // options.start.cap is always true for the app's fixed options (see
             // butterflyOptions), and taper is always disabled.
             List<Point> cap = new ArrayList<>();
             Point right0 = rightPoints.get(0);
@@ -863,10 +634,10 @@ final class PerfectFreehandGeometry {
         }
     }
 
-    /** Equivalent to perfect_freehand's {@code getStrokeRadius}. */
-    static double getStrokeRadius(
-            double size, double thinning, double pressure, DoubleUnaryOperator easing) {
-        return size * easing.applyAsDouble(0.5 - thinning * (0.5 - pressure));
+    /** Equivalent to perfect_freehand's {@code getStrokeRadius} under identity easing, the only
+     * easing the app's fixed options ever use. */
+    private static double getStrokeRadius(double size, double thinning, double pressure) {
+        return size * (0.5 - thinning * (0.5 - pressure));
     }
 
     /**
@@ -958,65 +729,19 @@ final class PerfectFreehandGeometry {
         final double thinning;
         final double smoothing;
         final double streamline;
-        final DoubleUnaryOperator easing;
         final boolean simulatePressure;
-        final EndOptions start;
-        final EndOptions end;
-        final boolean isComplete;
 
         Options(
                 double size,
                 double thinning,
                 double smoothing,
                 double streamline,
-                DoubleUnaryOperator easing,
-                boolean simulatePressure,
-                EndOptions start,
-                EndOptions end,
-                boolean isComplete) {
+                boolean simulatePressure) {
             this.size = size;
             this.thinning = thinning;
             this.smoothing = smoothing;
             this.streamline = streamline;
-            this.easing = easing;
             this.simulatePressure = simulatePressure;
-            this.start = start;
-            this.end = end;
-            this.isComplete = isComplete;
-        }
-    }
-
-    static final class EndOptions {
-        final boolean cap;
-        final boolean taperEnabled;
-        final Double customTaper;
-        final DoubleUnaryOperator easing;
-
-        private EndOptions(
-                boolean cap,
-                boolean taperEnabled,
-                Double customTaper,
-                DoubleUnaryOperator easing) {
-            boolean enabled = taperEnabled;
-            Double taper = customTaper;
-            if (taper != null) {
-                enabled = taper != 0.0;
-                if (taper == -1.0) {
-                    taper = null;
-                }
-            }
-            this.cap = cap;
-            this.taperEnabled = enabled;
-            this.customTaper = taper;
-            this.easing = easing;
-        }
-
-        static EndOptions start(boolean cap, boolean taperEnabled, Double customTaper) {
-            return new EndOptions(cap, taperEnabled, customTaper, START_EASING);
-        }
-
-        static EndOptions end(boolean cap, boolean taperEnabled, Double customTaper) {
-            return new EndOptions(cap, taperEnabled, customTaper, END_EASING);
         }
     }
 
@@ -1080,14 +805,6 @@ final class PerfectFreehandGeometry {
             return new Point(y, -x, null);
         }
 
-        Point unit() {
-            double length = Math.sqrt(x * x + y * y);
-            if (length == 0.0) {
-                return new Point(0.0, 0.0, null);
-            }
-            return new Point(x / length, y / length, null);
-        }
-
         Point project(Point direction, double distance) {
             return new Point(x + direction.x * distance, y + direction.y * distance, pressure);
         }
@@ -1133,35 +850,20 @@ final class PerfectFreehandGeometry {
     }
 
     static final class StrokePoint {
-        Point point;
+        final Point point;
         Point vector;
         final double distance;
         final double runningLength;
-        private final List<Point> sourcePoints;
-        private final int sourceIndex;
 
-        StrokePoint(
-                Point point,
-                Point vector,
-                double distance,
-                double runningLength,
-                List<Point> sourcePoints,
-                int sourceIndex) {
+        StrokePoint(Point point, Point vector, double distance, double runningLength) {
             this.point = point;
             this.vector = vector;
             this.distance = distance;
             this.runningLength = runningLength;
-            this.sourcePoints = sourcePoints;
-            this.sourceIndex = sourceIndex;
         }
 
         double pressure() {
             return point.pressure == null ? 0.5 : point.pressure;
-        }
-
-        void updatePressure(double pressure) {
-            point = point.withPressure(pressure);
-            sourcePoints.set(sourceIndex, sourcePoints.get(sourceIndex).withPressure(pressure));
         }
 
         double simulatePressure(double previousPressure, double size) {

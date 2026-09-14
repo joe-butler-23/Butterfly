@@ -84,7 +84,7 @@ public class PerfectFreehandGeometryParityTest {
 
         PerfectFreehandGeometry.Options options = fixture.options();
         PerfectFreehandGeometry.OutlineParts reference = PerfectFreehandGeometry.getStrokeOutlineParts(
-                PerfectFreehandGeometry.getStrokePoints(points, options), options, false);
+                PerfectFreehandGeometry.getStrokePoints(points, options), options);
 
         // Drive the engine exactly the way SharedGeometryInkOverlay does: an initial batch (the
         // points already appended by the time the first frame renders), then one point per call
