@@ -57,7 +57,7 @@ android {
         create("latencyLab") {
             dimension = "default"
             applicationIdSuffix = ".latencylab"
-            manifestPlaceholders["appName"] = "Butterfly Latency Lab"
+            manifestPlaceholders["appName"] = "butterfly-trial"
             manifestPlaceholders["mainActivityClass"] = ".LatencyLabActivity"
         }
     }

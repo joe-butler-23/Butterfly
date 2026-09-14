@@ -1,6 +1,7 @@
 package dev.linwood.butterfly;
 
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Display;
@@ -34,7 +35,7 @@ public final class LatencyLabActivity extends MainActivity {
     private boolean requestedSignalShown;
 
     @Override protected void onCreate(@Nullable Bundle savedInstanceState) {
-        mode = StylusLatencyMode.parse(getIntent().getStringExtra(StylusLatencyMode.EXTRA));
+        mode = resolveMode(getIntent());
         super.onCreate(savedInstanceState);
         showRequestedSignal();
         if (mode == StylusLatencyMode.Value.FLUTTER_ONLY) showActiveSignal();
@@ -155,10 +156,25 @@ public final class LatencyLabActivity extends MainActivity {
         return content.getChildAt(content.getChildCount() - 1);
     }
 
+    /** The extra wins; otherwise the launcher alias's meta-data names the mode. */
+    private StylusLatencyMode.Value resolveMode(Intent intent) {
+        String raw = intent.getStringExtra(StylusLatencyMode.EXTRA);
+        if (raw == null) {
+            try {
+                Bundle meta = getPackageManager().getActivityInfo(
+                        getComponentName(), PackageManager.GET_META_DATA).metaData;
+                if (meta != null) raw = meta.getString(StylusLatencyMode.EXTRA);
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // Fall through to the default mode.
+            }
+        }
+        return StylusLatencyMode.parse(raw);
+    }
+
     @Override protected void onNewIntent(@NonNull Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        mode = StylusLatencyMode.parse(intent.getStringExtra(StylusLatencyMode.EXTRA));
+        mode = resolveMode(intent);
         destroyWetInk();
         requestedSignalShown = false;
         showRequestedSignal();
