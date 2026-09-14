@@ -197,11 +197,6 @@ final class PerfectFreehandGeometry {
         return strokePoints;
     }
 
-    /** Equivalent to perfect_freehand's {@code getStrokeOutlinePoints}. */
-    static List<Point> getStrokeOutlinePoints(List<StrokePoint> points, Options options) {
-        return getStrokeOutlinePoints(points, options, false);
-    }
-
     /**
      * Equivalent to perfect_freehand's {@code getStrokeOutlinePoints}, including optional storage
      * of simulated pressures back into the caller's mutable point list.
@@ -423,7 +418,17 @@ final class PerfectFreehandGeometry {
      * outline. It deliberately does not call {@link Path#close()}.
      */
     static Path buildFilledQuadraticPath(List<Point> outlinePoints) {
-        Path path = new Path();
+        return buildFilledQuadraticPath(outlinePoints, new Path());
+    }
+
+    /**
+     * Same as {@link #buildFilledQuadraticPath(List)} but resets and reuses the caller's
+     * {@link Path} instead of allocating a new one every call. Only safe when the caller
+     * guarantees the Path is never touched concurrently (e.g. it is confined to a single
+     * render-callback thread), since {@code path.reset()} is not itself synchronized.
+     */
+    static Path buildFilledQuadraticPath(List<Point> outlinePoints, Path path) {
+        path.reset();
         if (outlinePoints.isEmpty()) {
             return path;
         }
@@ -550,16 +555,8 @@ final class PerfectFreehandGeometry {
             this.easing = easing;
         }
 
-        static EndOptions start() {
-            return new EndOptions(true, false, null, START_EASING);
-        }
-
         static EndOptions start(boolean cap, boolean taperEnabled, Double customTaper) {
             return new EndOptions(cap, taperEnabled, customTaper, START_EASING);
-        }
-
-        static EndOptions end() {
-            return new EndOptions(true, false, null, END_EASING);
         }
 
         static EndOptions end(boolean cap, boolean taperEnabled, Double customTaper) {

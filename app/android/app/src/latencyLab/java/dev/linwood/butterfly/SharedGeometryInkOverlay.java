@@ -8,6 +8,7 @@ import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.os.Build;
+import android.view.Choreographer;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -145,6 +146,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private final AtomicInteger pendingTransactions = new AtomicInteger();
     private final AtomicInteger pendingClear = new AtomicInteger();
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // Reused instead of allocating a Path per frame. Safe because every read/write of this field
+    // happens inside drawSnapshot(), which is only ever invoked from CanvasFrontBufferedRenderer's
+    // Callback methods, all of which run serially on that renderer's single background thread.
+    private final Path scratchPath = new Path();
 
     @Nullable private CanvasFrontBufferedRenderer<Request> renderer;
     @Nullable private RectF bounds;
@@ -320,12 +325,15 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         int pointer = event.getPointerId(index);
         switch (action) {
             case MotionEvent.ACTION_DOWN -> begin(event, pointer, locationX, locationY);
+            // A per-sample bounds check inside appendEvent drops any out-of-canvas point
+            // individually, the same way Flutter's PenHandler.addPoint does, instead of ending
+            // the stroke; only a pointer identity mismatch (unsupported multi-touch) aborts here.
             case MotionEvent.ACTION_MOVE -> {
-                if (pointer != activePointer || !inCanvas(event, index)) abortStroke();
+                if (pointer != activePointer) abortStroke();
                 else if (!appendEvent(event, index, false, locationX, locationY)) abortStroke();
             }
             case MotionEvent.ACTION_UP -> {
-                if (pointer != activePointer || !inCanvas(event, index)) {
+                if (pointer != activePointer) {
                     abortStroke();
                 } else if (appendEvent(event, index, true, locationX, locationY)) {
                     activePointer = -1;
@@ -360,16 +368,33 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private boolean appendEvent(MotionEvent event, int pointerIndex, boolean complete,
             float locationX, float locationY) {
         int initialPointCount = points.size();
+        // The device's pressure range is the same for every sample in one MotionEvent, so look
+        // it up once here instead of once per historical + trailing sample.
+        InputDevice device = event.getDevice();
+        InputDevice.MotionRange range = device == null ? null
+                : device.getMotionRange(MotionEvent.AXIS_PRESSURE);
+        float minimum = range == null ? 0f : range.getMin();
+        float maximum = range == null ? 1f : range.getMax();
         for (int history = 0; history < event.getHistorySize(); history++) {
-            if (!appendPoint(event.getHistoricalX(pointerIndex, history),
-                    event.getHistoricalY(pointerIndex, history),
-                    normalizedPressure(event.getHistoricalPressure(pointerIndex, history), event),
+            float x = event.getHistoricalX(pointerIndex, history);
+            float y = event.getHistoricalY(pointerIndex, history);
+            // Drop an out-of-canvas historical sample individually rather than aborting the
+            // whole batch or the stroke, matching Flutter's PenHandler.addPoint.
+            if (!inCanvas(x, y)) continue;
+            if (!appendPoint(x, y, normalizedPressure(
+                    event.getHistoricalPressure(pointerIndex, history), minimum, maximum),
                     locationX, locationY)) return false;
         }
-        if (!appendPoint(event.getX(pointerIndex), event.getY(pointerIndex),
-                normalizedPressure(event.getPressure(pointerIndex), event), locationX, locationY)) {
+        float x = event.getX(pointerIndex);
+        float y = event.getY(pointerIndex);
+        if (inCanvas(x, y) && !appendPoint(x, y,
+                normalizedPressure(event.getPressure(pointerIndex), minimum, maximum),
+                locationX, locationY)) {
             return false;
         }
+        // A degenerate stroke (0 or 1 point, e.g. every sample landed outside the canvas, or
+        // down/up coincided) was never submitted for rendering below, so there is no wet ink to
+        // hand off; aborting here is cleanup of the handoff entry, not a bounds decision.
         if (points.size() < 2) return !complete;
         boolean changed = points.size() != initialPointCount;
         if (changed || complete) {
@@ -417,12 +442,14 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (frontRenderOutstanding || drainPosted || pendingFront.get() != 0
                 || pendingMulti.get() != 0) return;
         drainPosted = true;
-        // The first submission is already on the UI thread. Later arrivals are
-        // coalesced at the view boundary while the renderer is busy.
+        // The first submission of a stroke renders synchronously, right here on the UI thread,
+        // so the first wet pixel is not delayed by a frame. Every later submission is coalesced
+        // onto the next vsync instead of draining as soon as the renderer frees up, so rapid
+        // unbuffered-dispatch motion events recompute geometry at most once per frame.
         if (latestSnapshot == null) {
             drainLatest();
         } else {
-            view.post(this::drainLatest);
+            Choreographer.getInstance().postFrameCallback(frameTimeNanos -> drainLatest());
         }
     }
 
@@ -738,12 +765,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                     }
                 }
             }
-            Path path = PerfectFreehandGeometry.buildFilledQuadraticPath(
+            PerfectFreehandGeometry.buildFilledQuadraticPath(
                     PerfectFreehandGeometry.getStroke(snapshot.points,
                             PerfectFreehandGeometry.butterflyOptions(snapshot.policy.width,
                                     snapshot.policy.thinning, snapshot.policy.smoothing,
-                                    snapshot.policy.streamline, simulate)));
-            canvas.drawPath(path, paint);
+                                    snapshot.policy.streamline, simulate)),
+                    scratchPath);
+            canvas.drawPath(scratchPath, paint);
             return true;
         } catch (RuntimeException | LinkageError error) {
             postFailure();
@@ -823,16 +851,20 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     private boolean inCanvas(MotionEvent event, int index) {
-        return bounds != null && bounds.contains(event.getX(index), event.getY(index));
+        return inCanvas(event.getX(index), event.getY(index));
     }
 
-    private static float normalizedPressure(float raw, MotionEvent event) {
-        InputDevice device = event.getDevice();
-        InputDevice.MotionRange range = device == null ? null
-                : device.getMotionRange(MotionEvent.AXIS_PRESSURE);
-        float minimum = range == null ? 0f : range.getMin();
-        float maximum = range == null ? 1f : range.getMax();
+    private boolean inCanvas(float x, float y) {
+        return bounds != null && bounds.contains(x, y);
+    }
+
+    private static float normalizedPressure(float raw, float minimum, float maximum) {
         float span = maximum - minimum;
+        // raw, minimum and maximum are already guaranteed finite here: eligibleSample()
+        // validates every sample's pressure and the device's min/max -- using this same event,
+        // so the same range -- before appendEvent ever runs. This branch is therefore
+        // unreachable in practice; left as a defensive mirror of Dart's getPressureOfEvent,
+        // which folds an unexpected NaN into 0.5 rather than propagating it.
         if (!Float.isFinite(raw) || !Float.isFinite(span)) return Float.NaN;
         if (span <= 0f) span = 1f;
         float pressure = (raw - minimum) / span;
