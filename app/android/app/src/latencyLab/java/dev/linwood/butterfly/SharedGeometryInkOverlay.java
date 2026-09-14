@@ -483,6 +483,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         pendingSnapshot = null;
         if (token == Long.MIN_VALUE) return;
         handoff.cancelNative(token);
+        checkHandoff();
         Snapshot snapshot = latestSnapshot;
         if (snapshot != null && snapshot.token == token) {
             clearRequested = true;
