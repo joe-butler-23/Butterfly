@@ -2,7 +2,6 @@ package dev.linwood.butterfly;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -21,88 +20,82 @@ public class StylusLatencyCoreTest {
     }
 
     @Test
-    public void canceledNativeStrokeDoesNotQuarantineFollowingStroke() {
+    public void finishedThenAckedRetires() {
         InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
         handoff.setGeneration(7);
-        handoff.addNativeStroke(7, 10_000, "canceled");
-        handoff.cancelNative("canceled");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
-        assertNull(handoff.cancel(7, 1, 10_000));
-        handoff.addNativeStroke(7, 20_000, "next");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
-        handoff.cancelNative("next");
-        assertNull(handoff.acknowledge(7, 2, 20_000, "element", 2));
-
-        handoff.rejectNativeStroke(7, 30_000);
-        handoff.register(new InkHandoffCoordinator.Registration(7, 3, 30_000));
-        assertNull(handoff.acknowledge(7, 3, 30_000, "declined", 2));
-
-        handoff.addNativeStroke(7, 40_000, "following");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 4, 40_000));
-        assertNull(handoff.markNativeFinished("following"));
-        assertEquals("following", handoff.acknowledge(7, 4, 40_000, "element", 2));
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        handoff.register(7, 10_000);
+        assertNull(handoff.markNativeFinished("stroke"));
+        assertEquals("stroke", handoff.acknowledge(7, 10_000, "element", 3));
+        // Retirable, but still tracked until the deferred frame callback confirms it.
+        assertEquals(1, handoff.retainedCount());
+        assertEquals("stroke", handoff.confirmRetired("stroke"));
+        assertEquals(0, handoff.retainedCount());
     }
 
     @Test
-    public void rejectedRegistrationCancelIsConsumed() {
+    public void ackedThenFinishedRetires() {
         InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
         handoff.setGeneration(7);
-        handoff.rejectNativeStroke(7, 10_000);
-        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
-        assertNull(handoff.cancel(7, 1, 10_000));
-
-        handoff.addNativeStroke(7, 20_000, "following");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
-        assertNull(handoff.markNativeFinished("following"));
-        assertEquals("following", handoff.acknowledge(7, 2, 20_000, "element", 2));
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        handoff.register(7, 10_000);
+        assertNull(handoff.acknowledge(7, 10_000, "element", 3));
+        assertEquals("stroke", handoff.markNativeFinished("stroke"));
+        assertEquals(1, handoff.retainedCount());
+        assertEquals("stroke", handoff.confirmRetired("stroke"));
+        assertEquals(0, handoff.retainedCount());
     }
 
     @Test
-    public void canceledAfterRegistrationCancelIsConsumed() {
+    public void cancelClearsAndLeavesNoTraceForNativeFinish() {
         InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
         handoff.setGeneration(7);
-        handoff.addNativeStroke(7, 10_000, "canceled");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
-        handoff.cancelNative("canceled");
-        assertNull(handoff.cancel(7, 1, 10_000));
-
-        handoff.addNativeStroke(7, 20_000, "following");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
-        assertNull(handoff.markNativeFinished("following"));
-        assertEquals("following", handoff.acknowledge(7, 2, 20_000, "element", 2));
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        handoff.register(7, 10_000);
+        assertEquals("stroke", handoff.cancel(7, 10_000));
+        assertNull(handoff.markNativeFinished("stroke"));
     }
 
     @Test
-    public void unconsumedCancelTombstonesAreBounded() {
+    public void unknownAckAndCancelAreIgnored() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        assertNull(handoff.acknowledge(7, 99_000, "element", 3));
+        assertNull(handoff.cancel(7, 99_000));
+    }
+
+    @Test
+    public void registrationAfterNativeAbortIsIgnored() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        handoff.cancelNative("stroke");
+        handoff.register(7, 10_000);
+        assertNull(handoff.acknowledge(7, 10_000, "element", 3));
+    }
+
+    @Test
+    public void confirmRetiredIsANoOpIfAlreadyRemoved() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        handoff.register(7, 10_000);
+        assertNull(handoff.markNativeFinished("stroke"));
+        assertEquals("stroke", handoff.acknowledge(7, 10_000, "element", 3));
+        // A cancel races ahead of the deferred frame callback and removes it first.
+        assertEquals("stroke", handoff.cancel(7, 10_000));
+        assertNull(handoff.confirmRetired("stroke"));
+    }
+
+    @Test
+    public void overflowEvictsOldestWithClear() {
         InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
         handoff.setGeneration(7);
         for (int sequence = 1; sequence <= 8; sequence++) {
-            long source = sequence * 10_000L;
-            handoff.rejectNativeStroke(7, source);
-            handoff.register(new InkHandoffCoordinator.Registration(7, sequence, source));
+            assertNull(handoff.addNativeStroke(7, sequence * 10_000L, "stroke-" + sequence));
         }
-        for (int sequence = 9; sequence <= 17; sequence++) {
-            long source = sequence * 10_000L;
-            String token = "canceled-" + sequence;
-            handoff.addNativeStroke(7, source, token);
-            handoff.register(new InkHandoffCoordinator.Registration(7, sequence, source));
-            handoff.cancelNative(token);
-        }
-        assertTrue(handoff.isQuarantined());
-    }
-
-    @Test
-    public void retiresWetInkOnlyAfterNativeFinishAndExactFlutterPaintAck() {
-        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
-        handoff.setGeneration(7);
-        handoff.addNativeStroke(7, 10_000, "native");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
-        assertNull(handoff.acknowledge(7, 1, 10_000, "element", 3));
-        assertEquals("native", handoff.markNativeFinished("native"));
-
-        handoff.addNativeStroke(7, 20_000, "next");
-        handoff.register(new InkHandoffCoordinator.Registration(7, 2, 20_000));
-        assertNull(handoff.markNativeFinished("next"));
-        assertEquals("next", handoff.acknowledge(7, 2, 20_000, "element-2", 4));
+        assertEquals(8, handoff.retainedCount());
+        assertEquals("stroke-1", handoff.addNativeStroke(7, 90_000, "stroke-9"));
+        assertEquals(8, handoff.retainedCount());
     }
 }

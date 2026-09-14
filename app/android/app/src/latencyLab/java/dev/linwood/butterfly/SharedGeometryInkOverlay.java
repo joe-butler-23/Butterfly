@@ -180,8 +180,15 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
                 SharedGeometryInkOverlay.this.surfaceChanged(false);
                 if (enabled) quarantine();
+                else resolveActivation(false);
             }
         };
+        view.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) {}
+            // The surface may never exist if the view is detached first; resolve the pending
+            // activation either way so Dart is never left awaiting forever.
+            @Override public void onViewDetachedFromWindow(View v) { resolveActivation(false); }
+        });
     }
 
     @Override public View getView() { return view; }
@@ -296,7 +303,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (!enabled || failed || !ready) return;
         int action = event.getActionMasked();
         if (clearRequested || pendingClear.get() != 0) {
-            if (action == MotionEvent.ACTION_DOWN) rejectNativeDown(event);
             return;
         }
         int index = event.getActionIndex();
@@ -306,7 +312,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 || event.getPointerCount() != 1 || index != 0
                 || !eligibleSample(event, index)) {
             if (active) abortStroke();
-            else if (action == MotionEvent.ACTION_DOWN) rejectNativeDown(event);
             return;
         }
         view.getLocationInWindow(location);
@@ -337,23 +342,19 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private void begin(MotionEvent event, int pointer, float locationX, float locationY) {
         if (activePointer != -1) {
             abortStroke();
-            rejectNativeDown(event);
             return;
         }
         if (handoff.retainedCount() != 0 || !inCanvas(event, 0)) {
-            rejectNativeDown(event);
             return;
         }
         activePointer = pointer;
         activeToken = ++nextToken;
         points.clear();
+        // retainedCount() == 0 was just checked above, so this insert can never overflow
+        // the bounded map; there is no per-token buffer here to clear if it somehow did.
         handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, activeToken);
         flutterInputView.requestUnbufferedDispatch(event);
         if (!appendEvent(event, 0, false, locationX, locationY)) abortStroke();
-    }
-
-    private void rejectNativeDown(MotionEvent event) {
-        handoff.rejectNativeStroke(generation, event.getEventTime() * 1_000L);
     }
 
     private boolean appendEvent(MotionEvent event, int pointerIndex, boolean complete,
@@ -483,7 +484,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         pendingSnapshot = null;
         if (token == Long.MIN_VALUE) return;
         handoff.cancelNative(token);
-        checkHandoff();
         Snapshot snapshot = latestSnapshot;
         if (snapshot != null && snapshot.token == token) {
             clearRequested = true;
@@ -494,33 +494,31 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Override public void registerStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
-        Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (requested == null || sequence == null || source == null
-                || requested.longValue() != generation) return;
+        if (requested == null || source == null || requested.longValue() != generation) return;
         if (!enabled || clearRequested || pendingClear.get() != 0) {
-            handoff.cancel(requested.longValue(), sequence.longValue(), source.longValue());
-            checkHandoff();
+            handoff.cancel(requested.longValue(), source.longValue());
             return;
         }
-        handoff.register(new InkHandoffCoordinator.Registration(requested.longValue(),
-                sequence.longValue(), source.longValue()));
-        checkHandoff();
+        handoff.register(requested.longValue(), source.longValue());
     }
 
     @Override public void acknowledgeStroke(Object arguments, Runnable completion) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
-        Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
         Number count = state == null ? null : number(state.get("finalPointCount"));
         Object id = state == null ? null : state.get("finalElementId");
-        if (enabled && requested != null && sequence != null && source != null
-                && count != null && id instanceof String) {
-            Long token = handoff.acknowledge(requested.longValue(), sequence.longValue(),
-                    source.longValue(), (String) id, count.intValue());
-            if (token != null) clearToken(token);
-            checkHandoff();
+        if (enabled && requested != null && source != null && count != null
+                && id instanceof String) {
+            Long token = handoff.acknowledge(requested.longValue(), source.longValue(),
+                    (String) id, count.intValue());
+            if (token != null) {
+                Long retiring = token;
+                InkHandoffCoordinator.deferClear(() -> {
+                    if (handoff.confirmRetired(retiring) != null) clearToken(retiring);
+                });
+            }
         }
         completion.run();
     }
@@ -528,20 +526,21 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Override public void cancelRegisteredStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
-        Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (requested == null || sequence == null || source == null) return;
-        Long token = handoff.cancel(requested.longValue(), sequence.longValue(),
-                source.longValue());
+        if (requested == null || source == null) return;
+        Long token = handoff.cancel(requested.longValue(), source.longValue());
         if (token != null) clearToken(token);
-        checkHandoff();
     }
 
     private void nativeFinished(long token, long callbackGeneration) {
         if (!enabled || failed || callbackGeneration != generation) return;
         Long removable = handoff.markNativeFinished(token);
-        if (removable != null) clearToken(removable);
-        checkHandoff();
+        if (removable != null) {
+            Long retiring = removable;
+            InkHandoffCoordinator.deferClear(() -> {
+                if (handoff.confirmRetired(retiring) != null) clearToken(retiring);
+            });
+        }
     }
 
     private void clearToken(long token) {
@@ -552,11 +551,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
         clearRequested = true;
         maybeIssueClear();
-    }
-
-    private void checkHandoff() {
-        for (Long token : handoff.drainEvictedTokens()) clearToken(token);
-        if (handoff.isQuarantined()) quarantine();
     }
 
     private void maybeIssueClear() {

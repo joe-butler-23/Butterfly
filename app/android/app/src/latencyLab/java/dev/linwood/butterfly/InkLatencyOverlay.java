@@ -19,7 +19,6 @@ import androidx.ink.strokes.Stroke;
 import androidx.input.motionprediction.MotionEventPredictor;
 
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /** AndroidX Ink draws transient wet ink while Flutter receives every original event. */
@@ -56,10 +55,13 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
             @Override
             public void onStrokesFinished(Map<InProgressStrokeId, Stroke> strokes) {
                 for (InProgressStrokeId stroke : strokes.keySet()) {
-                    InProgressStrokeId removable = handoff.markNativeFinished(stroke);
-                    if (removable != null) removeFinished(removable);
+                    InProgressStrokeId retiring = handoff.markNativeFinished(stroke);
+                    if (retiring != null) {
+                        InkHandoffCoordinator.deferClear(() -> {
+                            if (handoff.confirmRetired(retiring) != null) removeFinished(retiring);
+                        });
+                    }
                 }
-                removeEvicted();
             }
         };
         view.addFinishedStrokesListener(finishedListener);
@@ -131,12 +133,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
 
     @Override public void onMotionEvent(@NonNull MotionEvent source) {
         if (!enabled || failed) return;
-        if (!shouldStartOrContinue(source)) {
-            if (source.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                rejectNativeDown(source);
-            }
-            return;
-        }
+        if (!shouldStartOrContinue(source)) return;
         MotionEvent event = null;
         MotionEvent prediction = null;
         try {
@@ -183,23 +180,21 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     private void start(MotionEvent event, MotionEvent original) {
         if (!active.isEmpty()) {
             cancelActiveStroke();
-            rejectNativeDown(event);
             return;
         }
         if (handoff.retainedCount() != 0 || !inOverlay(event, 0)) {
-            rejectNativeDown(event);
             return;
         }
         int pointer = event.getPointerId(0);
         InProgressStrokeId stroke = view.startStroke(event, pointer, brush);
         active.put(pointer, stroke);
-        handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, stroke);
+        InProgressStrokeId evicted = handoff.addNativeStroke(generation,
+                event.getEventTime() * 1_000L, stroke);
         flutterInputView.requestUnbufferedDispatch(original);
-        removeEvicted();
-    }
-
-    private void rejectNativeDown(MotionEvent event) {
-        handoff.rejectNativeStroke(generation, event.getEventTime() * 1_000L);
+        if (evicted != null) {
+            cancelStroke(evicted, null);
+            removeFinished(evicted);
+        }
     }
 
     private void append(MotionEvent event, MotionEvent prediction) {
@@ -253,40 +248,33 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
         }
         active.clear();
         predictor = null;
-        removeEvicted();
     }
 
     @Override public void registerStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
-        Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (requested == null || sequence == null || source == null
-                || requested.longValue() != generation) return;
-        if (!enabled) {
-            handoff.cancel(requested.longValue(), sequence.longValue(), source.longValue());
-            removeEvicted();
-            return;
-        }
-        handoff.register(new InkHandoffCoordinator.Registration(
-                requested.longValue(), sequence.longValue(), source.longValue()));
-        removeEvicted();
+        if (requested == null || source == null || requested.longValue() != generation) return;
+        handoff.register(requested.longValue(), source.longValue());
     }
 
     @Override public void acknowledgeStroke(Object arguments, Runnable completion) {
         try {
             Map<?, ?> state = map(arguments);
             Number requested = state == null ? null : number(state.get("generation"));
-            Number sequence = state == null ? null : number(state.get("strokeSequence"));
             Number source = state == null ? null : number(state.get("sourceTimestampUs"));
             Number count = state == null ? null : number(state.get("finalPointCount"));
             Object id = state == null ? null : state.get("finalElementId");
-            if (!enabled || requested == null || sequence == null || source == null
-                    || count == null || !(id instanceof String)) return;
+            if (requested == null || source == null || count == null
+                    || !(id instanceof String)) return;
             InProgressStrokeId stroke = handoff.acknowledge(requested.longValue(),
-                    sequence.longValue(), source.longValue(), (String) id, count.intValue());
-            if (stroke != null) removeFinished(stroke);
-            removeEvicted();
+                    source.longValue(), (String) id, count.intValue());
+            if (stroke != null) {
+                InProgressStrokeId retiring = stroke;
+                InkHandoffCoordinator.deferClear(() -> {
+                    if (handoff.confirmRetired(retiring) != null) removeFinished(retiring);
+                });
+            }
         } finally {
             completion.run();
         }
@@ -295,16 +283,13 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     @Override public void cancelRegisteredStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
-        Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (requested == null || sequence == null || source == null) return;
-        InProgressStrokeId stroke = handoff.cancel(requested.longValue(), sequence.longValue(),
-                source.longValue());
+        if (requested == null || source == null) return;
+        InProgressStrokeId stroke = handoff.cancel(requested.longValue(), source.longValue());
         if (stroke != null) {
             cancelStroke(stroke, null);
             removeFinished(stroke);
         }
-        removeEvicted();
     }
 
     @Override public void disable() {
@@ -321,15 +306,6 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     @Override public void destroy() {
         disable();
         view.removeFinishedStrokesListener(finishedListener);
-    }
-
-    private void removeEvicted() {
-        List<InProgressStrokeId> strokes = handoff.drainEvictedTokens();
-        for (InProgressStrokeId stroke : strokes) {
-            cancelStroke(stroke, null);
-            removeFinished(stroke);
-        }
-        if (handoff.isQuarantined()) quarantine();
     }
 
     private void quarantine() {

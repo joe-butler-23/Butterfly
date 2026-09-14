@@ -30,20 +30,16 @@ public final class LatencyLabActivity extends MainActivity {
     @Nullable private StylusWetInkRenderer wetInk;
     private long configuredGeneration = Long.MIN_VALUE;
     private boolean resumed, focused, multiWindow, pictureInPicture;
-    private long failureNotifiedGeneration = Long.MIN_VALUE;
     @Nullable private MethodChannel channel;
     private boolean requestedSignalShown;
-    private int lifecycleEpoch;
 
     @Override protected void onCreate(@Nullable Bundle savedInstanceState) {
         mode = StylusLatencyMode.parse(getIntent().getStringExtra(StylusLatencyMode.EXTRA));
         super.onCreate(savedInstanceState);
         showRequestedSignal();
         if (mode == StylusLatencyMode.Value.FLUTTER_ONLY) showActiveSignal();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            multiWindow = isInMultiWindowMode();
-            pictureInPicture = isInPictureInPictureMode();
-        }
+        multiWindow = isInMultiWindowMode();
+        pictureInPicture = isInPictureInPictureMode();
     }
 
     @Override public void configureFlutterEngine(@NonNull FlutterEngine engine) {
@@ -118,7 +114,6 @@ public final class LatencyLabActivity extends MainActivity {
                 showFallbackSignal();
                 return;
             }
-            int epoch = lifecycleEpoch;
             if (!renderer.attachAndPrewarm()) {
                 boolean failureAlreadySignaled = renderer != wetInk;
                 destroyWetInk();
@@ -127,8 +122,7 @@ public final class LatencyLabActivity extends MainActivity {
                 return;
             }
             renderer.awaitActivation(enabled -> {
-                boolean accepted = enabled && renderer == wetInk && resumed
-                        && epoch == lifecycleEpoch;
+                boolean accepted = enabled && renderer == wetInk && resumed;
                 if (!accepted) {
                     destroyWetInk();
                     showFallbackSignal();
@@ -189,13 +183,11 @@ public final class LatencyLabActivity extends MainActivity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
-        lifecycleEpoch++;
         applyDisplayPreference();
     }
 
     @Override protected void onPause() {
         resumed = false;
-        lifecycleEpoch++;
         destroyWetInk();
         clearDisplayPreference();
         super.onPause();
@@ -226,9 +218,7 @@ public final class LatencyLabActivity extends MainActivity {
 
     private void onRendererFailure(StylusWetInkRenderer renderer, long failureGeneration) {
         runOnUiThread(() -> {
-            if (renderer != wetInk || failureGeneration != configuredGeneration
-                    || failureNotifiedGeneration == failureGeneration) return;
-            failureNotifiedGeneration = failureGeneration;
+            if (renderer != wetInk || failureGeneration != configuredGeneration) return;
             destroyWetInk();
             showFallbackSignal();
             MethodChannel currentChannel = channel;

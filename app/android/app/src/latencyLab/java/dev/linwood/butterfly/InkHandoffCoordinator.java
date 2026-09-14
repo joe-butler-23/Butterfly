@@ -1,339 +1,146 @@
 package dev.linwood.butterfly;
 
+import android.view.Choreographer;
+
 import androidx.annotation.Nullable;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
-import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Bounded matching between native DOWN events and Dart paint acknowledgements. */
+/**
+ * Bounded handoff between a native wet-ink stroke and Flutter's dry-ink acknowledgement.
+ *
+ * <p>Dart's {@code sourceTimestampUs} is derived from {@code MotionEvent.getEventTime()*1000}
+ * by the Flutter Android embedder, so it is bit-for-bit identical to the native DOWN event's
+ * timestamp. That lets every message be matched by an exact key instead of nearest-timestamp
+ * fuzzy matching, which is what makes this bounded map sufficient on its own: an unknown key
+ * simply means there is no wet ink to reconcile.
+ */
 final class InkHandoffCoordinator<T> {
-    private static final long SOURCE_TIME_TOLERANCE_US = 2_000L;
-    private static final int MAX_RETAINED = 16;
-
-    static final class Registration {
-        final long generation;
-        final long sequence;
-        final long sourceTimestampUs;
-
-        Registration(long generation, long sequence, long sourceTimestampUs) {
-            this.generation = generation;
-            this.sequence = sequence;
-            this.sourceTimestampUs = sourceTimestampUs;
-        }
-    }
-
-    private static final class Key {
-        final long generation;
-        final long sequence;
-        final long sourceTimestampUs;
-
-        Key(long generation, long sequence, long sourceTimestampUs) {
-            this.generation = generation;
-            this.sequence = sequence;
-            this.sourceTimestampUs = sourceTimestampUs;
-        }
-
-        @Override public boolean equals(Object other) {
-            if (!(other instanceof Key)) return false;
-            Key key = (Key) other;
-            return generation == key.generation && sequence == key.sequence
-                    && sourceTimestampUs == key.sourceTimestampUs;
-        }
-
-        @Override public int hashCode() {
-            int result = Long.hashCode(generation);
-            result = 31 * result + Long.hashCode(sequence);
-            return 31 * result + Long.hashCode(sourceTimestampUs);
-        }
-    }
+    private static final int MAX_RETAINED = 8;
 
     private static final class Entry<T> {
         final T token;
-        final long generation;
         final long sourceTimestampUs;
-        Registration registration;
-        boolean finished;
+        boolean registered;
+        boolean nativeFinished;
         boolean acknowledged;
 
-        Entry(T token, long generation, long sourceTimestampUs) {
+        Entry(T token, long sourceTimestampUs) {
             this.token = token;
-            this.generation = generation;
             this.sourceTimestampUs = sourceTimestampUs;
         }
     }
 
-    private final Deque<Entry<T>> entries = new ArrayDeque<>();
-    private final Deque<Registration> pendingRegistrations = new ArrayDeque<>();
+    private final Map<Long, Entry<T>> byTimestamp = new LinkedHashMap<>();
     private final Map<T, Entry<T>> byToken = new HashMap<>();
-    private final Map<Long, Entry<T>> bySequence = new HashMap<>();
-    private final Map<Key, Boolean> pendingAcks = new HashMap<>();
-    private final Map<Key, Boolean> pendingCancels = new HashMap<>();
-    private final Deque<T> evicted = new ArrayDeque<>();
-    private final Deque<Long> canceledNativeSources = new ArrayDeque<>();
     private long generation = Long.MIN_VALUE;
-    private boolean quarantined;
 
     void setGeneration(long value) {
         clear();
         generation = value;
-        quarantined = false;
-    }
-
-    void addNativeStroke(long expectedGeneration, long sourceTimestampUs, T token) {
-        if (quarantined || expectedGeneration != generation || token == null
-                || sourceTimestampUs < 0) return;
-        if (byToken.containsKey(token)) {
-            quarantineAndEvict();
-            return;
-        }
-        Entry<T> entry = new Entry<>(token, expectedGeneration, sourceTimestampUs);
-        entries.addLast(entry);
-        byToken.put(token, entry);
-        Registration registration = takeClosestPending(expectedGeneration, sourceTimestampUs);
-        if (registration != null) attach(entry, registration);
-        if (entries.size() > MAX_RETAINED) quarantineAndEvict();
-    }
-
-    void register(Registration registration) {
-        if (quarantined || registration == null || registration.generation != generation
-                || registration.sequence <= 0 || registration.sourceTimestampUs < 0) return;
-        if (bySequence.containsKey(registration.sequence)
-                || containsPendingSequence(registration.sequence)) {
-            quarantineAndEvict();
-            return;
-        }
-        Key key = key(registration);
-        if (removeCanceledNativeSource(registration.sourceTimestampUs)) {
-            retainCancel(key);
-            return;
-        }
-        if (pendingCancels.remove(key) != null) {
-            Entry<T> candidate = closestUnregistered(registration.generation,
-                    registration.sourceTimestampUs);
-            if (candidate != null) evict(candidate);
-            return;
-        }
-        Entry<T> candidate = closestUnregistered(registration.generation,
-                registration.sourceTimestampUs);
-        if (candidate != null) {
-            attach(candidate, registration);
-        } else {
-            pendingRegistrations.addLast(registration);
-            if (pendingRegistrations.size() > MAX_RETAINED) quarantineAndEvict();
-        }
-    }
-
-    @Nullable T markNativeFinished(T token) {
-        Entry<T> entry = byToken.get(token);
-        if (entry == null) return null;
-        entry.finished = true;
-        return entry.acknowledged ? retire(entry) : null;
-    }
-
-    @Nullable T acknowledge(long expectedGeneration, long sequence, long sourceTimestampUs,
-            String elementId, int pointCount) {
-        if (quarantined || expectedGeneration != generation || sequence <= 0
-                || sourceTimestampUs < 0 || elementId == null || elementId.isEmpty()
-                || pointCount <= 1) return null;
-        Entry<T> entry = bySequence.get(sequence);
-        if (entry == null) {
-            Key key = new Key(expectedGeneration, sequence, sourceTimestampUs);
-            if (pendingCancels.remove(key) == null) {
-                pendingAcks.put(key, Boolean.TRUE);
-                if (pendingAcks.size() + pendingCancels.size() > MAX_RETAINED) {
-                    quarantineAndEvict();
-                }
-            }
-            return null;
-        }
-        if (entry.registration.sourceTimestampUs != sourceTimestampUs) {
-            quarantineAndEvict();
-            return null;
-        }
-        entry.acknowledged = true;
-        return entry.finished ? retire(entry) : null;
-    }
-
-    @Nullable T cancel(long expectedGeneration, long sequence, long sourceTimestampUs) {
-        if (quarantined || expectedGeneration != generation || sequence <= 0
-                || sourceTimestampUs < 0) return null;
-        Key key = new Key(expectedGeneration, sequence, sourceTimestampUs);
-        if (pendingCancels.remove(key) != null) {
-            pendingAcks.remove(key);
-            removePending(key);
-            return null;
-        }
-        pendingAcks.remove(key);
-        removePending(key);
-        Entry<T> entry = bySequence.get(sequence);
-        if (entry == null) {
-            retainCancel(key);
-            return null;
-        }
-        if (entry.registration.sourceTimestampUs != sourceTimestampUs) {
-            quarantineAndEvict();
-            return null;
-        }
-        return retire(entry);
-    }
-
-    void cancelNative(T token) {
-        Entry<T> entry = byToken.get(token);
-        if (entry == null) return;
-        reject(entry);
-        retire(entry);
-    }
-
-    void rejectNativeStroke(long expectedGeneration, long sourceTimestampUs) {
-        if (quarantined || expectedGeneration != generation || sourceTimestampUs < 0) return;
-        canceledNativeSources.addLast(sourceTimestampUs);
-        while (canceledNativeSources.size() > MAX_RETAINED) {
-            canceledNativeSources.removeFirst();
-        }
-    }
-
-    private void reject(Entry<T> entry) {
-        Registration registration = entry.registration;
-        if (registration == null) {
-            rejectNativeStroke(entry.generation, entry.sourceTimestampUs);
-            return;
-        }
-        retainCancel(key(registration));
-    }
-
-    private void retainCancel(Key key) {
-        pendingAcks.remove(key);
-        pendingCancels.put(key, Boolean.TRUE);
-        if (pendingAcks.size() + pendingCancels.size() > MAX_RETAINED) {
-            quarantineAndEvict();
-        }
-    }
-
-    int retainedCount() { return entries.size(); }
-    boolean isQuarantined() { return quarantined; }
-
-    List<T> drainEvictedTokens() {
-        if (evicted.isEmpty()) return Collections.emptyList();
-        List<T> result = new ArrayList<>(evicted);
-        evicted.clear();
-        return result;
     }
 
     void clear() {
-        entries.clear();
-        pendingRegistrations.clear();
+        byTimestamp.clear();
         byToken.clear();
-        bySequence.clear();
-        pendingAcks.clear();
-        pendingCancels.clear();
-        evicted.clear();
-        canceledNativeSources.clear();
     }
 
-    private boolean removeCanceledNativeSource(long sourceTimestampUs) {
-        Iterator<Long> iterator = canceledNativeSources.iterator();
-        while (iterator.hasNext()) {
-            if (iterator.next() == sourceTimestampUs) {
-                iterator.remove();
-                return true;
-            }
+    int retainedCount() { return byTimestamp.size(); }
+
+    /**
+     * Starts tracking a native stroke. Returns the oldest entry's token if bounding the map
+     * evicted it, in which case the caller must clear that token's wet ink immediately.
+     */
+    @Nullable T addNativeStroke(long expectedGeneration, long sourceTimestampUs, T token) {
+        if (expectedGeneration != generation || token == null || sourceTimestampUs < 0) {
+            return null;
         }
-        return false;
+        Entry<T> entry = new Entry<>(token, sourceTimestampUs);
+        byTimestamp.put(sourceTimestampUs, entry);
+        byToken.put(token, entry);
+        if (byTimestamp.size() <= MAX_RETAINED) return null;
+        Iterator<Entry<T>> oldest = byTimestamp.values().iterator();
+        Entry<T> evicted = oldest.next();
+        oldest.remove();
+        byToken.remove(evicted.token);
+        return evicted.token;
     }
 
-    private void attach(Entry<T> entry, Registration registration) {
-        entry.registration = registration;
-        bySequence.put(registration.sequence, entry);
-        Key key = key(registration);
-        if (pendingCancels.remove(key) != null) {
-            evict(entry);
-        } else if (pendingAcks.remove(key) != null) {
-            entry.acknowledged = true;
-            if (entry.finished) evict(entry);
-        }
+    /** A registration for an unknown key (native never started, or already aborted) is a no-op. */
+    void register(long expectedGeneration, long sourceTimestampUs) {
+        if (expectedGeneration != generation || sourceTimestampUs < 0) return;
+        Entry<T> entry = byTimestamp.get(sourceTimestampUs);
+        if (entry != null) entry.registered = true;
     }
 
-    @Nullable private Entry<T> closestUnregistered(long expectedGeneration,
-            long sourceTimestampUs) {
-        Entry<T> best = null;
-        long bestDistance = Long.MAX_VALUE;
-        for (Entry<T> entry : entries) {
-            if (entry.generation != expectedGeneration || entry.registration != null) continue;
-            long distance = Math.abs(entry.sourceTimestampUs - sourceTimestampUs);
-            if (distance <= SOURCE_TIME_TOLERANCE_US && distance < bestDistance) {
-                best = entry;
-                bestDistance = distance;
-            }
-        }
-        return best;
+    /**
+     * Returns the token once native has already finished it too, meaning the stroke is fully
+     * retirable. The entry stays tracked (so {@link #retainedCount} still counts it, keeping a
+     * new stroke from starting mid-handoff) until the caller confirms the retirement from a
+     * frame callback (see {@link #deferClear} and {@link #confirmRetired}); an unknown key
+     * means there is no wet ink to reconcile.
+     */
+    @Nullable T acknowledge(long expectedGeneration, long sourceTimestampUs, String elementId,
+            int pointCount) {
+        if (expectedGeneration != generation || sourceTimestampUs < 0 || elementId == null
+                || elementId.isEmpty() || pointCount <= 1) return null;
+        Entry<T> entry = byTimestamp.get(sourceTimestampUs);
+        if (entry == null) return null;
+        entry.acknowledged = true;
+        return entry.nativeFinished ? entry.token : null;
     }
 
-    @Nullable private Registration takeClosestPending(long expectedGeneration,
-            long sourceTimestampUs) {
-        Registration best = null;
-        long bestDistance = Long.MAX_VALUE;
-        for (Registration registration : pendingRegistrations) {
-            if (registration.generation != expectedGeneration) continue;
-            long distance = Math.abs(registration.sourceTimestampUs - sourceTimestampUs);
-            if (distance <= SOURCE_TIME_TOLERANCE_US && distance < bestDistance) {
-                best = registration;
-                bestDistance = distance;
-            }
-        }
-        if (best != null) pendingRegistrations.remove(best);
-        return best;
+    /** Cancellation removes the entry immediately: no dry ink exists yet to race against. */
+    @Nullable T cancel(long expectedGeneration, long sourceTimestampUs) {
+        if (expectedGeneration != generation || sourceTimestampUs < 0) return null;
+        Entry<T> entry = byTimestamp.get(sourceTimestampUs);
+        return entry == null ? null : retire(entry);
     }
 
-    private boolean containsPendingSequence(long sequence) {
-        for (Registration registration : pendingRegistrations) {
-            if (registration.sequence == sequence) return true;
-        }
-        return false;
+    /** Native-side abort of an in-progress stroke; also immediate, for the same reason. */
+    @Nullable T cancelNative(T token) {
+        Entry<T> entry = byToken.get(token);
+        return entry == null ? null : retire(entry);
     }
 
-    private void removePending(Key key) {
-        Iterator<Registration> iterator = pendingRegistrations.iterator();
-        while (iterator.hasNext()) {
-            Registration registration = iterator.next();
-            if (key.equals(key(registration))) {
-                iterator.remove();
-                return;
-            }
-        }
+    /**
+     * Returns the token once Flutter already acknowledged it, meaning the stroke is fully
+     * retirable. The entry stays tracked until {@link #confirmRetired} (see {@link #acknowledge}
+     * for why).
+     */
+    @Nullable T markNativeFinished(T token) {
+        Entry<T> entry = byToken.get(token);
+        if (entry == null) return null;
+        entry.nativeFinished = true;
+        return entry.acknowledged ? entry.token : null;
     }
 
-    private static Key key(Registration registration) {
-        return new Key(registration.generation, registration.sequence,
-                registration.sourceTimestampUs);
+    /**
+     * Called from the deferred frame callback to actually remove a retirable entry. Returns
+     * the token if it was still tracked, or null if something else already removed it (for
+     * example a cancellation racing ahead of the deferred callback) so the caller can skip a
+     * redundant clear.
+     */
+    @Nullable T confirmRetired(T token) {
+        Entry<T> entry = byToken.get(token);
+        return entry == null ? null : retire(entry);
     }
 
-    private void evict(Entry<T> entry) {
-        T token = retire(entry);
-        if (token != null) evicted.addLast(token);
-    }
-
-    @Nullable private T retire(Entry<T> entry) {
-        if (!entries.remove(entry)) return null;
+    private T retire(Entry<T> entry) {
+        byTimestamp.remove(entry.sourceTimestampUs);
         byToken.remove(entry.token);
-        if (entry.registration != null) bySequence.remove(entry.registration.sequence);
         return entry.token;
     }
 
-    private void quarantineAndEvict() {
-        quarantined = true;
-        for (Entry<T> entry : entries) evicted.addLast(entry.token);
-        entries.clear();
-        pendingRegistrations.clear();
-        byToken.clear();
-        bySequence.clear();
-        pendingAcks.clear();
-        pendingCancels.clear();
-        canceledNativeSources.clear();
+    /**
+     * A one-frame overlap of wet and dry ink is acceptable; a gap is not. Flutter's
+     * acknowledgement only means its frame was recorded, not presented, so the native clear is
+     * delayed one vsync to give that frame a chance to reach the screen first.
+     */
+    static void deferClear(Runnable clearWetInk) {
+        Choreographer.getInstance().postFrameCallback(frameTimeNanos -> clearWetInk.run());
     }
 }
