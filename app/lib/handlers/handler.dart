@@ -91,7 +91,7 @@ part 'stamp.dart';
 part 'texture.dart';
 part 'undo.dart';
 
-const nativeInkLabEnabled = bool.fromEnvironment('BUTTERFLY_DIRECT_INK_LAB');
+const nativeInkLabEnabled = appFlavor == 'latencyLab';
 
 typedef NativeInkStrokeIdentity = ({
   int generation,
@@ -106,7 +106,7 @@ class EventContext {
   final bool isShiftPressed, isAltPressed, isCtrlPressed;
   final NativeInkStrokeIdentity? Function(PointerDownEvent event)?
   registerNativeInkStroke;
-  final void Function(
+  final bool Function(
     NativeInkStrokeIdentity identity,
     String elementId,
     int pointCount,

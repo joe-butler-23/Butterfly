@@ -137,7 +137,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
                     || (event.getFlags() & MotionEvent.FLAG_CANCELED) != 0
                     || event.getPointerCount() != 1 || index != 0
                     || !eligibleSample(event, index)) {
-                quarantine();
+                cancelActiveStroke();
                 return;
             }
             if (predictionArm) {
@@ -149,7 +149,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
                 case MotionEvent.ACTION_DOWN -> start(event, source);
                 case MotionEvent.ACTION_MOVE -> append(event, prediction);
                 case MotionEvent.ACTION_UP -> finish(event);
-                default -> quarantine();
+                default -> cancelActiveStroke();
             }
         } catch (RuntimeException | LinkageError error) {
             quarantine();
@@ -169,10 +169,11 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
     }
 
     private void start(MotionEvent event, MotionEvent original) {
-        if (!active.isEmpty() || !inOverlay(event, 0)) {
-            quarantine();
+        if (!active.isEmpty()) {
+            cancelActiveStroke();
             return;
         }
+        if (handoff.retainedCount() != 0 || !inOverlay(event, 0)) return;
         int pointer = event.getPointerId(0);
         InProgressStrokeId stroke = view.startStroke(event, pointer, brush);
         active.put(pointer, stroke);
@@ -183,14 +184,14 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
 
     private void append(MotionEvent event, MotionEvent prediction) {
         if (active.size() != 1) {
-            quarantine();
+            cancelActiveStroke();
             return;
         }
         Map.Entry<Integer, InProgressStrokeId> entry = active.entrySet().iterator().next();
         int pointer = entry.getKey();
         int index = event.findPointerIndex(pointer);
         if (index != 0 || !inOverlay(event, index)) {
-            quarantine();
+            cancelActiveStroke();
             return;
         }
         view.addToStroke(event, pointer, entry.getValue(), prediction);
@@ -198,7 +199,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
 
     private void finish(MotionEvent event) {
         if (active.size() != 1) {
-            quarantine();
+            cancelActiveStroke();
             return;
         }
         Map.Entry<Integer, InProgressStrokeId> entry = active.entrySet().iterator().next();
@@ -206,7 +207,7 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
         int index = event.findPointerIndex(pointer);
         if (index != 0 || event.getPointerId(event.getActionIndex()) != pointer
                 || !inOverlay(event, index)) {
-            quarantine();
+            cancelActiveStroke();
             return;
         }
         try {
@@ -219,6 +220,20 @@ final class InkLatencyOverlay implements StylusWetInkRenderer {
             active.remove(pointer);
             predictor = null;
         }
+    }
+
+    private void cancelActiveStroke() {
+        if (active.isEmpty()) {
+            predictor = null;
+            return;
+        }
+        for (InProgressStrokeId stroke : active.values()) {
+            cancelStroke(stroke, null);
+            handoff.cancelNative(stroke);
+        }
+        active.clear();
+        predictor = null;
+        removeEvicted();
     }
 
     @Override public void registerStroke(Object arguments) {

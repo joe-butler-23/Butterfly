@@ -7,6 +7,62 @@ Handler _getViewportHandler(DocumentLoaded state, EditorController cubit) =>
         editable: cubit.saveCubit.state.embedding?.editable != false,
       );
 
+Object? _nativeInkToolKey(ToolRuntimeState state) {
+  final handler = state.temporaryHandler ?? state.handler;
+  if (handler is! PenHandler) return null;
+  final pen = handler.data;
+  final property = pen.property;
+  return (
+    handlerType: handler.runtimeType,
+    zoomDependent: pen.zoomDependent,
+    shapeDetectionEnabled: pen.shapeDetectionEnabled,
+    combinePaths: pen.combinePaths,
+    strokeWidth: property.strokeWidth,
+    thinning: property.thinning,
+    smoothing: property.smoothing,
+    streamline: property.streamline,
+    paint: property.paint,
+    fillPaint: property.fillPaint,
+  );
+}
+
+bool _nativeInkInputEqual(
+  InputConfiguration previous,
+  InputConfiguration current,
+) =>
+    previous.pen == current.pen &&
+    const DeepCollectionEquality().equals(
+      previous.holdShortcuts,
+      current.holdShortcuts,
+    ) &&
+    previous.doublePenShortcut == current.doublePenShortcut &&
+    previous.triplePenShortcut == current.triplePenShortcut &&
+    previous.doubleInvertedPenShortcut == current.doubleInvertedPenShortcut &&
+    previous.tripleInvertedPenShortcut == current.tripleInvertedPenShortcut &&
+    previous.doubleFirstPenButtonShortcut ==
+        current.doubleFirstPenButtonShortcut &&
+    previous.tripleFirstPenButtonShortcut ==
+        current.tripleFirstPenButtonShortcut &&
+    previous.doubleSecondPenButtonShortcut ==
+        current.doubleSecondPenButtonShortcut &&
+    previous.tripleSecondPenButtonShortcut ==
+        current.tripleSecondPenButtonShortcut;
+
+bool _nativeInkSettingsChanged(
+  ButterflySettings previous,
+  ButterflySettings current,
+) =>
+    previous.ignorePressure != current.ignorePressure ||
+    !_nativeInkInputEqual(
+      previous.inputConfiguration,
+      current.inputConfiguration,
+    );
+
+bool _hasPointerManipulator(ToolRuntimeState state) => state
+    .toggleableHandlers
+    .values
+    .any((handler) => handler is PointerManipulationHandler);
+
 class _LoadedViewport extends StatelessWidget {
   const _LoadedViewport({
     required this.bloc,
@@ -89,15 +145,18 @@ class _LoadedViewport extends StatelessWidget {
           onForegroundPaintedElements: nativeInk == null
               ? null
               : (receipts) {
-                  final painted = receipts.toList(growable: false);
-                  nativeInk?.acknowledgePaintedElements(painted);
-                  if (!getHandler().onForegroundPaintedElements(painted)) {
+                  final bridge = nativeInk;
+                  if (bridge == null || !bridge.needsForegroundRetirement) {
                     return;
                   }
+                  final painted = receipts.toList(growable: false);
                   WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (context.mounted) {
-                      unawaited(bloc.refreshForegroundsOnly());
+                    if (!context.mounted) return;
+                    bridge.acknowledgePaintedElements(painted);
+                    if (!getHandler().onForegroundPaintedElements(painted)) {
+                      return;
                     }
+                    unawaited(bloc.refreshForegroundsOnly());
                   });
                 },
         ),
@@ -135,12 +194,9 @@ class _LoadedViewport extends StatelessWidget {
       final handler = currentState is DocumentLoaded
           ? _getViewportHandler(currentState, cubit)
           : getHandler();
-      final hasPointerManipulator = cubit
-          .toolCubit
-          .state
-          .toggleableHandlers
-          .values
-          .any((handler) => handler is PointerManipulationHandler);
+      final hasPointerManipulator = _hasPointerManipulator(
+        cubit.toolCubit.state,
+      );
       final allowed =
           currentState is DocumentLoadSuccess &&
           currentState.currentArea == null &&
@@ -164,6 +220,9 @@ class _LoadedViewport extends StatelessWidget {
   Widget build(BuildContext context) {
     final cubit = context.read<EditorController>();
     Handler getHandler() => _getViewportHandler(state, cubit);
+    if (nativeInk != null) {
+      _scheduleNativeInk(context, cubit, getHandler);
+    }
 
     final viewport = BlocBuilder<RendererCubit, RendererRuntimeState>(
       buildWhen: (previous, current) =>
@@ -183,10 +242,6 @@ class _LoadedViewport extends StatelessWidget {
                   (realSize.width - viewportSize.width).abs() < 2 &&
                   (realSize.height - viewportSize.height).abs() < 2;
               if (state is DocumentLoadSuccess && !viewportMatches) bake();
-              if (nativeInk != null) {
-                _scheduleNativeInk(context, cubit, getHandler);
-              }
-
               return Actions(
                 actions: getHandler().getActions(context),
                 child: DefaultTextEditingShortcuts(
@@ -212,16 +267,28 @@ class _LoadedViewport extends StatelessWidget {
     return MultiBlocListener(
       listeners: [
         BlocListener<TransformCubit, CameraTransform>(
-          listener: (context, _) =>
-              _scheduleNativeInk(context, cubit, getHandler),
+          listenWhen: (previous, current) => previous.size != current.size,
+          listener: (context, _) {
+            nativeInk?.disarm();
+            _scheduleNativeInk(context, cubit, getHandler);
+          },
         ),
         BlocListener<SettingsCubit, ButterflySettings>(
-          listener: (context, _) =>
-              _scheduleNativeInk(context, cubit, getHandler),
+          listenWhen: _nativeInkSettingsChanged,
+          listener: (context, _) {
+            nativeInk?.disarm();
+            _scheduleNativeInk(context, cubit, getHandler);
+          },
         ),
         BlocListener<ToolCubit, ToolRuntimeState>(
-          listener: (context, _) =>
-              _scheduleNativeInk(context, cubit, getHandler),
+          listenWhen: (previous, current) =>
+              _nativeInkToolKey(previous) != _nativeInkToolKey(current) ||
+              _hasPointerManipulator(previous) !=
+                  _hasPointerManipulator(current),
+          listener: (context, _) {
+            nativeInk?.disarm();
+            _scheduleNativeInk(context, cubit, getHandler);
+          },
         ),
       ],
       child: viewport,

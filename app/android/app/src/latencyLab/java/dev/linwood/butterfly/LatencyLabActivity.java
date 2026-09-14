@@ -1,5 +1,6 @@
 package dev.linwood.butterfly;
 
+import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Display;
@@ -11,6 +12,7 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -28,11 +30,15 @@ public final class LatencyLabActivity extends MainActivity {
     @Nullable private StylusWetInkRenderer wetInk;
     private long configuredGeneration = Long.MIN_VALUE;
     private boolean resumed, focused, multiWindow, pictureInPicture;
+    @Nullable private MethodChannel channel;
+    private boolean requestedSignalShown;
     private int lifecycleEpoch;
 
     @Override protected void onCreate(@Nullable Bundle savedInstanceState) {
         mode = StylusLatencyMode.parse(getIntent().getStringExtra(StylusLatencyMode.EXTRA));
         super.onCreate(savedInstanceState);
+        showRequestedSignal();
+        if (mode == StylusLatencyMode.Value.FLUTTER_ONLY) showActiveSignal();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             multiWindow = isInMultiWindowMode();
             pictureInPicture = isInPictureInPictureMode();
@@ -41,10 +47,14 @@ public final class LatencyLabActivity extends MainActivity {
 
     @Override public void configureFlutterEngine(@NonNull FlutterEngine engine) {
         super.configureFlutterEngine(engine);
-        new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL)
-                .setMethodCallHandler((call, result) -> {
+        channel = new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL);
+        channel.setMethodCallHandler((call, result) -> {
                     switch (call.method) {
-                        case "configure" -> result.success(configureWetInk(call.arguments));
+                        case "configure" -> {
+                            boolean configured = configureWetInk(call.arguments);
+                            if (!configured) showFallbackSignal();
+                            result.success(configured);
+                        }
                         case "enable" -> enableWetInk(call.arguments, result);
                         case "disable" -> {
                             if (matchesConfiguredGeneration(call.arguments)) destroyWetInk();
@@ -70,45 +80,63 @@ public final class LatencyLabActivity extends MainActivity {
     }
 
     private boolean configureWetInk(Object arguments) {
-        destroyWetInk();
-        if (mode == StylusLatencyMode.Value.FLUTTER_ONLY || !resumed) return false;
-        View flutterView = flutterView();
-        if (flutterView == null) return false;
-        wetInk = switch (mode) {
-            case INK_PREDICTION_OFF -> new InkLatencyOverlay(this, flutterView, false);
-            case INK_PREDICTION_ON -> new InkLatencyOverlay(this, flutterView, true);
-            case SHARED_GEOMETRY -> new SharedGeometryInkOverlay(this, flutterView);
-            default -> null;
-        };
-        StylusWetInkRenderer renderer = wetInk;
-        if (renderer == null || !renderer.configure(arguments)) {
+        try {
+            destroyWetInk();
+            if (mode == StylusLatencyMode.Value.FLUTTER_ONLY || !resumed) return false;
+            View flutterView = flutterView();
+            if (flutterView == null) return false;
+            wetInk = switch (mode) {
+                case INK_PREDICTION_OFF -> new InkLatencyOverlay(this, flutterView, false);
+                case INK_PREDICTION_ON -> new InkLatencyOverlay(this, flutterView, true);
+                case SHARED_GEOMETRY -> new SharedGeometryInkOverlay(this, flutterView);
+                default -> null;
+            };
+            StylusWetInkRenderer renderer = wetInk;
+            if (renderer == null || !renderer.configure(arguments)) {
+                destroyWetInk();
+                return false;
+            }
+            configuredGeneration = generation(arguments);
+            return configuredGeneration != Long.MIN_VALUE;
+        } catch (RuntimeException | LinkageError error) {
             destroyWetInk();
             return false;
         }
-        configuredGeneration = generation(arguments);
-        return configuredGeneration != Long.MIN_VALUE;
     }
 
     private void enableWetInk(Object arguments, MethodChannel.Result result) {
-        StylusWetInkRenderer renderer = wetInk;
-        if (renderer == null || !resumed || !matchesConfiguredGeneration(arguments)
-                || !renderer.enable(arguments) || !attach(renderer)) {
+        try {
+            StylusWetInkRenderer renderer = wetInk;
+            if (renderer == null || !resumed || !matchesConfiguredGeneration(arguments)
+                    || !renderer.enable(arguments) || !attach(renderer)) {
+                destroyWetInk();
+                result.success(false);
+                showFallbackSignal();
+                return;
+            }
+            int epoch = lifecycleEpoch;
+            if (!renderer.attachAndPrewarm()) {
+                destroyWetInk();
+                result.success(false);
+                showFallbackSignal();
+                return;
+            }
+            renderer.awaitActivation(enabled -> {
+                boolean accepted = enabled && renderer == wetInk && resumed
+                        && epoch == lifecycleEpoch;
+                if (!accepted) {
+                    destroyWetInk();
+                    showFallbackSignal();
+                } else {
+                    showActiveSignal();
+                }
+                result.success(accepted);
+            });
+        } catch (RuntimeException | LinkageError error) {
             destroyWetInk();
+            showFallbackSignal();
             result.success(false);
-            return;
         }
-        int epoch = lifecycleEpoch;
-        if (!renderer.attachAndPrewarm()) {
-            destroyWetInk();
-            result.success(false);
-            return;
-        }
-        renderer.awaitActivation(enabled -> {
-            boolean accepted = enabled && renderer == wetInk && resumed
-                    && epoch == lifecycleEpoch;
-            if (!accepted) destroyWetInk();
-            result.success(accepted);
-        });
     }
 
     private boolean attach(StylusWetInkRenderer renderer) {
@@ -126,6 +154,18 @@ public final class LatencyLabActivity extends MainActivity {
         ViewGroup content = findViewById(android.R.id.content);
         if (content == null || content.getChildCount() == 0) return null;
         return content.getChildAt(content.getChildCount() - 1);
+    }
+
+    @Override protected void onNewIntent(@NonNull Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        mode = StylusLatencyMode.parse(intent.getStringExtra(StylusLatencyMode.EXTRA));
+        destroyWetInk();
+        requestedSignalShown = false;
+        showRequestedSignal();
+        if (mode == StylusLatencyMode.Value.FLUTTER_ONLY) showActiveSignal();
+        MethodChannel currentChannel = channel;
+        if (currentChannel != null) currentChannel.invokeMethod("armChanged", mode.name());
     }
 
     @Override public boolean dispatchTouchEvent(MotionEvent event) {
@@ -195,7 +235,12 @@ public final class LatencyLabActivity extends MainActivity {
             clearDisplayPreference();
             return;
         }
-        Display display = getDisplay();
+        Display display;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display = getDisplay();
+        } else {
+            display = getWindowManager().getDefaultDisplay();
+        }
         if (display != null) {
             Display.Mode current = display.getMode();
             Display.Mode fastest = current;
@@ -241,6 +286,20 @@ public final class LatencyLabActivity extends MainActivity {
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 : View.SYSTEM_UI_FLAG_VISIBLE);
+    }
+
+    private void showRequestedSignal() {
+        if (requestedSignalShown) return;
+        requestedSignalShown = true;
+        Toast.makeText(this, "Latency Lab requested: " + mode.name(), Toast.LENGTH_SHORT).show();
+    }
+
+    private void showActiveSignal() {
+        Toast.makeText(this, "Latency Lab active: " + mode.name(), Toast.LENGTH_SHORT).show();
+    }
+
+    private void showFallbackSignal() {
+        Toast.makeText(this, "Latency Lab fallback: " + mode.name(), Toast.LENGTH_SHORT).show();
     }
 
     private boolean matchesConfiguredGeneration(Object arguments) {

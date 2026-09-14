@@ -71,6 +71,27 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
     }
 
+    private static final class PendingStroke {
+        final long token, generation;
+        final List<PerfectFreehandGeometry.Point> points;
+        final Policy policy;
+        boolean complete, checkpoint;
+
+        PendingStroke(long token, long generation, List<PerfectFreehandGeometry.Point> points,
+                Policy policy, boolean complete, boolean checkpoint) {
+            this.token = token;
+            this.generation = generation;
+            this.points = points;
+            this.policy = policy;
+            this.complete = complete;
+            this.checkpoint = checkpoint;
+        }
+
+        Snapshot snapshot() {
+            return new Snapshot(token, generation, points, policy, complete, checkpoint);
+        }
+    }
+
     private static final class Request {
         @Nullable final Snapshot snapshot;
         final Kind kind;
@@ -128,7 +149,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Nullable private CanvasFrontBufferedRenderer<Request> renderer;
     @Nullable private RectF bounds;
     @Nullable private Policy policy;
-    @Nullable private Snapshot pendingSnapshot;
+    @Nullable private PendingStroke pendingSnapshot;
     @Nullable private Snapshot latestSnapshot;
     @Nullable private ActivationCallback activationCallback;
     @Nullable private Runnable acknowledgementCompletion;
@@ -269,83 +290,85 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     @Override public void onMotionEvent(@NonNull MotionEvent event) {
         if (!enabled || failed || !ready) return;
-        if (clearRequested || pendingClear.get() != 0) {
-            quarantine();
-            return;
-        }
+        if (clearRequested || pendingClear.get() != 0) return;
         int action = event.getActionMasked();
         int index = event.getActionIndex();
+        boolean active = activePointer != -1;
         if (action == MotionEvent.ACTION_CANCEL
                 || (event.getFlags() & MotionEvent.FLAG_CANCELED) != 0
                 || event.getPointerCount() != 1 || index != 0
                 || !eligibleSample(event, index)) {
-            quarantine();
+            if (active) abortStroke();
             return;
         }
+        view.getLocationInWindow(location);
+        float locationX = location[0];
+        float locationY = location[1];
         int pointer = event.getPointerId(index);
         switch (action) {
-            case MotionEvent.ACTION_DOWN -> begin(event, pointer);
+            case MotionEvent.ACTION_DOWN -> begin(event, pointer, locationX, locationY);
             case MotionEvent.ACTION_MOVE -> {
-                if (pointer != activePointer || !inCanvas(event, index)) quarantine();
-                else appendEvent(event, index, false);
+                if (pointer != activePointer || !inCanvas(event, index)) abortStroke();
+                else if (!appendEvent(event, index, false, locationX, locationY)) abortStroke();
             }
             case MotionEvent.ACTION_UP -> {
-                if (pointer != activePointer || !inCanvas(event, index)) quarantine();
-                else {
-                    appendEvent(event, index, true);
+                if (pointer != activePointer || !inCanvas(event, index)) {
+                    abortStroke();
+                } else if (appendEvent(event, index, true, locationX, locationY)) {
                     activePointer = -1;
+                } else {
+                    abortStroke();
                 }
             }
-            default -> quarantine();
+            default -> {
+                if (active) abortStroke();
+            }
         }
     }
 
-    private void begin(MotionEvent event, int pointer) {
-        if (activePointer != -1 || handoff.retainedCount() != 0 || !inCanvas(event, 0)) {
-            quarantine();
+    private void begin(MotionEvent event, int pointer, float locationX, float locationY) {
+        if (activePointer != -1) {
+            abortStroke();
             return;
         }
+        if (handoff.retainedCount() != 0 || !inCanvas(event, 0)) return;
         activePointer = pointer;
         activeToken = ++nextToken;
         points.clear();
         handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, activeToken);
         flutterInputView.requestUnbufferedDispatch(event);
-        appendEvent(event, 0, false);
+        if (!appendEvent(event, 0, false, locationX, locationY)) abortStroke();
     }
 
-    private void appendEvent(MotionEvent event, int pointerIndex, boolean complete) {
+    private boolean appendEvent(MotionEvent event, int pointerIndex, boolean complete,
+            float locationX, float locationY) {
         for (int history = 0; history < event.getHistorySize(); history++) {
             if (!appendPoint(event.getHistoricalX(pointerIndex, history),
                     event.getHistoricalY(pointerIndex, history),
-                    normalizedPressure(event.getHistoricalPressure(pointerIndex, history), event))) {
-                return;
-            }
+                    normalizedPressure(event.getHistoricalPressure(pointerIndex, history), event),
+                    locationX, locationY)) return false;
         }
         if (!appendPoint(event.getX(pointerIndex), event.getY(pointerIndex),
-                normalizedPressure(event.getPressure(pointerIndex), event))) return;
-        if (points.size() < 2) {
-            if (complete) quarantine();
-            return;
+                normalizedPressure(event.getPressure(pointerIndex), event), locationX, locationY)) {
+            return false;
         }
+        if (points.size() < 2) return !complete;
         submit(complete, !complete && points.size() % CHECKPOINT_POINTS == 0);
+        return true;
     }
 
-    private boolean appendPoint(float windowX, float windowY, float pressure) {
-        view.getLocationInWindow(location);
-        float x = windowX - location[0];
-        float y = windowY - location[1];
+    private boolean appendPoint(float windowX, float windowY, float pressure,
+            float locationX, float locationY) {
+        float x = windowX - locationX;
+        float y = windowY - locationY;
         if (!Float.isFinite(x) || !Float.isFinite(y) || !Float.isFinite(pressure)) {
-            quarantine();
             return false;
         }
         if (!points.isEmpty()) {
             PerfectFreehandGeometry.Point last = points.get(points.size() - 1);
             if (last.x == x && last.y == y) return true;
         }
-        if (points.size() == MAX_POINTS) {
-            quarantine();
-            return false;
-        }
+        if (points.size() == MAX_POINTS) return false;
         if (policy != null && policy.firstPressure && points.size() == 1) {
             PerfectFreehandGeometry.Point first = points.get(0);
             points.set(0, new PerfectFreehandGeometry.Point(first.x, first.y,
@@ -357,22 +380,36 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     private void submit(boolean complete, boolean checkpoint) {
         Policy currentPolicy = policy;
-        if (currentPolicy == null) {
+        if (currentPolicy == null || activeToken == Long.MIN_VALUE) {
             quarantine();
             return;
         }
-        pendingSnapshot = new Snapshot(activeToken, generation, points, currentPolicy,
-                complete, checkpoint);
+        PendingStroke pending = pendingSnapshot;
+        if (pending != null && pending.token == activeToken
+                && pending.generation == generation) {
+            pending.complete |= complete;
+            pending.checkpoint |= checkpoint;
+        } else {
+            pendingSnapshot = new PendingStroke(activeToken, generation, points, currentPolicy,
+                    complete, checkpoint);
+        }
         if (!drainPosted) {
             drainPosted = true;
-            view.post(this::drainLatest);
+            // The first submission is already on the UI thread. Later arrivals are
+            // coalesced at the view boundary while the renderer is busy.
+            if (latestSnapshot == null && pendingFront.get() == 0 && pendingMulti.get() == 0) {
+                drainLatest();
+            } else {
+                view.post(this::drainLatest);
+            }
         }
     }
 
     private void drainLatest() {
         drainPosted = false;
-        Snapshot snapshot = pendingSnapshot;
+        PendingStroke pending = pendingSnapshot;
         pendingSnapshot = null;
+        Snapshot snapshot = pending == null ? null : pending.snapshot();
         CanvasFrontBufferedRenderer<Request> currentRenderer = renderer;
         if (snapshot == null || currentRenderer == null || failed || !enabled
                 || snapshot.generation != generation) return;
@@ -393,13 +430,28 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
     }
 
+    private void abortStroke() {
+        long token = activeToken;
+        activePointer = -1;
+        activeToken = Long.MIN_VALUE;
+        points.clear();
+        pendingSnapshot = null;
+        if (token == Long.MIN_VALUE) return;
+        handoff.cancelNative(token);
+        Snapshot snapshot = latestSnapshot;
+        if (snapshot != null && snapshot.token == token) {
+            clearRequested = true;
+            maybeIssueClear();
+        }
+    }
+
     @Override public void registerStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
         Number sequence = state == null ? null : number(state.get("strokeSequence"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (!enabled || requested == null || sequence == null || source == null
-                || requested.longValue() != generation) return;
+        if (!enabled || clearRequested || pendingClear.get() != 0 || requested == null
+                || sequence == null || source == null || requested.longValue() != generation) return;
         handoff.register(new InkHandoffCoordinator.Registration(requested.longValue(),
                 sequence.longValue(), source.longValue()));
         checkHandoff();

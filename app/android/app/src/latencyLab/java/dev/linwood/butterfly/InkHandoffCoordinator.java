@@ -75,6 +75,7 @@ final class InkHandoffCoordinator<T> {
     private final Map<Key, Boolean> pendingAcks = new HashMap<>();
     private final Map<Key, Boolean> pendingCancels = new HashMap<>();
     private final Deque<T> evicted = new ArrayDeque<>();
+    private final Deque<Long> canceledNativeSources = new ArrayDeque<>();
     private long generation = Long.MIN_VALUE;
     private boolean quarantined;
 
@@ -108,6 +109,10 @@ final class InkHandoffCoordinator<T> {
             return;
         }
         Key key = key(registration);
+        if (removeCanceledNativeSource(registration.sourceTimestampUs)) {
+            if (pendingCancels.remove(key) == null) pendingCancels.put(key, Boolean.TRUE);
+            return;
+        }
         if (pendingCancels.remove(key) != null) {
             Entry<T> candidate = closestUnregistered(registration.generation,
                     registration.sourceTimestampUs);
@@ -139,7 +144,7 @@ final class InkHandoffCoordinator<T> {
         Entry<T> entry = bySequence.get(sequence);
         if (entry == null) {
             Key key = new Key(expectedGeneration, sequence, sourceTimestampUs);
-            if (!pendingCancels.containsKey(key)) {
+            if (pendingCancels.remove(key) == null) {
                 pendingAcks.put(key, Boolean.TRUE);
                 if (pendingAcks.size() + pendingCancels.size() > MAX_RETAINED) {
                     quarantineAndEvict();
@@ -178,7 +183,14 @@ final class InkHandoffCoordinator<T> {
 
     void cancelNative(T token) {
         Entry<T> entry = byToken.get(token);
-        if (entry != null) retire(entry);
+        if (entry == null) return;
+        if (entry.registration == null) {
+            canceledNativeSources.addLast(entry.sourceTimestampUs);
+            while (canceledNativeSources.size() > MAX_RETAINED) {
+                canceledNativeSources.removeFirst();
+            }
+        }
+        retire(entry);
     }
 
     int retainedCount() { return entries.size(); }
@@ -199,6 +211,18 @@ final class InkHandoffCoordinator<T> {
         pendingAcks.clear();
         pendingCancels.clear();
         evicted.clear();
+        canceledNativeSources.clear();
+    }
+
+    private boolean removeCanceledNativeSource(long sourceTimestampUs) {
+        Iterator<Long> iterator = canceledNativeSources.iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next() == sourceTimestampUs) {
+                iterator.remove();
+                return true;
+            }
+        }
+        return false;
     }
 
     private void attach(Entry<T> entry, Registration registration) {
@@ -288,5 +312,6 @@ final class InkHandoffCoordinator<T> {
         bySequence.clear();
         pendingAcks.clear();
         pendingCancels.clear();
+        canceledNativeSources.clear();
     }
 }

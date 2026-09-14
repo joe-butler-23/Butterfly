@@ -20,6 +20,20 @@ public class StylusLatencyCoreTest {
     }
 
     @Test
+    public void canceledNativeStrokeDoesNotQuarantineFollowingStroke() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        handoff.addNativeStroke(7, 10_000, "canceled");
+        handoff.cancelNative("canceled");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 10_000));
+        assertNull(handoff.cancel(7, 1, 10_000));
+        handoff.addNativeStroke(7, 20_000, "next");
+        handoff.register(new InkHandoffCoordinator.Registration(7, 1, 20_000));
+        assertNull(handoff.markNativeFinished("next"));
+        assertEquals("next", handoff.acknowledge(7, 1, 20_000, "element", 2));
+    }
+
+    @Test
     public void retiresWetInkOnlyAfterNativeFinishAndExactFlutterPaintAck() {
         InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
         handoff.setGeneration(7);

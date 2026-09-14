@@ -7,7 +7,8 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   final Map<int, PenElement> elements = {};
   final Map<int, List<PathPoint>> _elementPoints = {};
   final List<PenElement> _submittedElements = [];
-  final Map<int, void Function(String elementId, int pointCount)>?
+  final Set<String> _nativeOwnedElementIds = {};
+  final Map<int, bool Function(String elementId, int pointCount)>?
   _nativeInkFinalizers = nativeInkLabEnabled ? {} : null;
   final Map<int, VoidCallback>? _nativeInkCancellers = nativeInkLabEnabled
       ? {}
@@ -121,8 +122,13 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
       final cancel = _nativeInkCancellers?.remove(pointer);
       final finalize = _nativeInkFinalizers?.remove(pointer);
       final id = element.id;
-      if (finalize != null && id != null && element.points.length > 1) {
-        finalize(id, element.points.length);
+      final nativeOwned =
+          finalize != null &&
+          id != null &&
+          element.points.length > 1 &&
+          finalize(id, element.points.length);
+      if (nativeOwned) {
+        _nativeOwnedElementIds.add(id);
       } else {
         cancel?.call();
       }
@@ -146,7 +152,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     _submittedElements.removeWhere(
       (element) =>
           createdIds.contains(element.id) &&
-          (!nativeInkLabEnabled || element.points.length <= 1),
+          !_nativeOwnedElementIds.contains(element.id),
     );
     final changed = previousLength != _submittedElements.length;
     if (changed && _submittedElements.isEmpty && elements.isEmpty) {
@@ -159,9 +165,12 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   bool onForegroundPaintedElements(
     Iterable<({String elementId, int? pointCount})> elements,
   ) {
-    if (!nativeInkLabEnabled || _submittedElements.isEmpty) return false;
+    if (_nativeOwnedElementIds.isEmpty || _submittedElements.isEmpty) {
+      return false;
+    }
     final painted = <String, Set<int>>{};
     for (final receipt in elements) {
+      if (!_nativeOwnedElementIds.contains(receipt.elementId)) continue;
       final pointCount = receipt.pointCount;
       if (pointCount != null) {
         (painted[receipt.elementId] ??= {}).add(pointCount);
@@ -170,8 +179,10 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     final previousLength = _submittedElements.length;
     _submittedElements.removeWhere((element) {
       final id = element.id;
-      return id != null &&
-          (painted[id]?.contains(element.points.length) ?? false);
+      final removed =
+          id != null && (painted[id]?.contains(element.points.length) ?? false);
+      if (removed) _nativeOwnedElementIds.remove(id);
+      return removed;
     });
     final changed = previousLength != _submittedElements.length;
     if (changed && _submittedElements.isEmpty && this.elements.isEmpty) {
@@ -561,6 +572,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     }
     elements.clear();
     _submittedElements.clear();
+    _nativeOwnedElementIds.clear();
     lastPosition.clear();
     isDrawing = false;
     lastPosit = null;

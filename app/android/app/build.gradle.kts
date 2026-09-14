@@ -122,5 +122,5 @@ dependencies {
     add("latencyLabImplementation", "androidx.ink:ink-strokes:1.0.0")
     add("latencyLabImplementation", "androidx.input:input-motionprediction:1.0.0")
 
-    testImplementation("junit:junit:4.13.2")
+    add("testLatencyLabImplementation", "junit:junit:4.13.2")
 }

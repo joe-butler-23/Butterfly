@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io' show Platform;
 
 import 'package:butterfly/cubits/settings.dart';
@@ -51,6 +50,21 @@ class NativeInkGeometry {
     'streamline': streamline,
     'pressurePolicy': pressurePolicy.name,
   };
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NativeInkGeometry &&
+          argb == other.argb &&
+          width == other.width &&
+          thinning == other.thinning &&
+          smoothing == other.smoothing &&
+          streamline == other.streamline &&
+          pressurePolicy == other.pressurePolicy;
+
+  @override
+  int get hashCode =>
+      Object.hash(argb, width, thinning, smoothing, streamline, pressurePolicy);
 }
 
 @immutable
@@ -86,6 +100,27 @@ class NativeInkState {
     },
     'devicePixelRatio': devicePixelRatio,
   };
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NativeInkState &&
+          generation == other.generation &&
+          argb == other.argb &&
+          width == other.width &&
+          geometry == other.geometry &&
+          canvasBounds == other.canvasBounds &&
+          devicePixelRatio == other.devicePixelRatio;
+
+  @override
+  int get hashCode => Object.hash(
+    generation,
+    argb,
+    width,
+    geometry,
+    canvasBounds,
+    devicePixelRatio,
+  );
 }
 
 @immutable
@@ -119,6 +154,8 @@ class _Handoff {
   final List<_Registration> _retired = [];
   int _nextSequence = 0;
   bool overflowed = false;
+
+  bool get hasFinals => _ordered.any((stroke) => stroke.finalElementId != null);
 
   _Registration register({
     required int generation,
@@ -246,7 +283,9 @@ class NativeInkBridge {
   NativeInkBridge({MethodChannel? channel, bool? enabled})
     : _channel = channel ?? const MethodChannel(_channelName),
       _available =
-          enabled ?? (nativeInkLabEnabled && !kIsWeb && Platform.isAndroid);
+          enabled ?? (nativeInkLabEnabled && !kIsWeb && Platform.isAndroid) {
+    _channel.setMethodCallHandler(_handleMethodCall);
+  }
 
   final MethodChannel _channel;
   final _Handoff _handoff = _Handoff();
@@ -255,12 +294,58 @@ class NativeInkBridge {
   bool _disposed = false;
   int _generation = 0;
   int _controlEpoch = 0;
-  String? _fingerprint;
+  int _activationTicket = 0;
+  bool _activationInFlight = false;
+  bool _retireForegrounds = false;
   NativeInkState? _state;
+  ({
+    Handler handler,
+    ButterflySettings settings,
+    Rect? canvasBounds,
+    double devicePixelRatio,
+    CameraTransform camera,
+    bool allowNativeInk,
+  })?
+  _lastRequest;
   VoidCallback? _pendingFrameCallback;
   bool _frameCallbackScheduled = false;
 
   bool get enabled => _enabled;
+
+  bool get awaitingPaintHandoff => _enabled && _handoff.hasFinals;
+
+  bool get needsForegroundRetirement =>
+      awaitingPaintHandoff || _retireForegrounds;
+
+  void _clearHandoff() {
+    _retireForegrounds |= _handoff.hasFinals;
+    _handoff.clear();
+  }
+
+  Future<Object?> _handleMethodCall(MethodCall call) async {
+    if (call.method != 'armChanged') return null;
+    if (call.arguments == 'FLUTTER_ONLY') {
+      unawaited(disable());
+      return null;
+    }
+    disarm();
+    final request = _lastRequest;
+    if (request != null) {
+      scheduleAfterFrame(
+        () => unawaited(
+          updateState(
+            handler: request.handler,
+            settings: request.settings,
+            canvasBounds: request.canvasBounds,
+            devicePixelRatio: request.devicePixelRatio,
+            camera: request.camera,
+            allowNativeInk: request.allowNativeInk,
+          ),
+        ),
+      );
+    }
+    return null;
+  }
 
   void scheduleAfterFrame(VoidCallback callback) {
     if (_disposed || !_available) return;
@@ -284,6 +369,14 @@ class NativeInkBridge {
     bool allowNativeInk = true,
   }) async {
     if (_disposed || !_available) return null;
+    _lastRequest = (
+      handler: handler,
+      settings: settings,
+      canvasBounds: canvasBounds,
+      devicePixelRatio: devicePixelRatio,
+      camera: camera,
+      allowNativeInk: allowNativeInk,
+    );
     final pen = handler is PenHandler ? handler.data : null;
     final eligible =
         allowNativeInk &&
@@ -311,19 +404,19 @@ class NativeInkBridge {
       streamline: property.streamline,
       pressurePolicy: settings.ignorePressure,
     );
-    final fingerprint = jsonEncode({
-      'argb': brush.argb,
-      'width': brush.width,
-      'geometry': geometry.toMap(),
-      'bounds': [
-        canvasBounds.left,
-        canvasBounds.top,
-        canvasBounds.right,
-        canvasBounds.bottom,
-      ],
-      'dpr': devicePixelRatio,
-    });
-    if (fingerprint == _fingerprint && _enabled) return _state;
+    final previous = _state;
+    if (previous != null &&
+        _sameConfiguration(
+          previous,
+          brush,
+          geometry,
+          canvasBounds,
+          devicePixelRatio,
+        ) &&
+        (_enabled ||
+            (_activationInFlight && _activationTicket == _controlEpoch))) {
+      return previous;
+    }
 
     final ticket = ++_controlEpoch;
     final state = NativeInkState(
@@ -335,55 +428,73 @@ class NativeInkBridge {
       devicePixelRatio: devicePixelRatio,
     );
     _enabled = false;
-    _fingerprint = fingerprint;
     _state = state;
-    _handoff.clear();
-
-    final configured = await _invoke<Object>('configure', state.toMap());
-    if (!_available ||
-        ticket != _controlEpoch ||
-        _state?.generation != state.generation) {
-      return null;
+    _clearHandoff();
+    _activationTicket = ticket;
+    _activationInFlight = true;
+    try {
+      final configured = await _invoke<Object>('configure', state.toMap());
+      if (!_available ||
+          ticket != _controlEpoch ||
+          _state?.generation != state.generation) {
+        return null;
+      }
+      if (configured != true) {
+        _enabled = false;
+        _state = null;
+        _clearHandoff();
+        return null;
+      }
+      final activated = await _invoke<Object>('enable', {
+        'generation': state.generation,
+      });
+      if (!_available ||
+          ticket != _controlEpoch ||
+          _state?.generation != state.generation) {
+        return null;
+      }
+      _enabled = activated == true;
+      if (!_enabled) {
+        await disable();
+        return null;
+      }
+      return state;
+    } finally {
+      if (_activationTicket == ticket) _activationInFlight = false;
     }
-    if (configured != true) {
-      _available = false;
-      _state = null;
-      _fingerprint = null;
-      _handoff.clear();
-      return null;
-    }
-    final activated = await _invoke<Object>('enable', {
-      'generation': state.generation,
-    });
-    if (!_available ||
-        ticket != _controlEpoch ||
-        _state?.generation != state.generation) {
-      return null;
-    }
-    _enabled = activated == true;
-    if (!_enabled) await disable();
-    return _enabled ? state : null;
   }
 
-  void disarm() {
+  static bool _sameConfiguration(
+    NativeInkState state,
+    NativeInkBrush brush,
+    NativeInkGeometry geometry,
+    Rect bounds,
+    double dpr,
+  ) =>
+      state.argb == brush.argb &&
+      state.width == brush.width &&
+      state.geometry == geometry &&
+      state.canvasBounds == bounds &&
+      state.devicePixelRatio == dpr;
+
+  void disarm({bool notifyNative = true}) {
+    final generation = _state?.generation;
     _controlEpoch++;
     _enabled = false;
     _pendingFrameCallback = null;
+    if (notifyNative && generation != null) {
+      unawaited(_invoke<void>('disable', {'generation': generation}));
+    }
   }
 
   Future<void> disable() async {
     final generation = _state?.generation;
-    disarm();
-    final registrations = _handoff.clear();
+    _retireForegrounds |= _handoff.hasFinals;
+    disarm(notifyNative: false);
+    _clearHandoff();
     _state = null;
-    _fingerprint = null;
-    if (!_available) return;
-    for (final registration in registrations) {
-      await _invoke<void>('cancelStroke', registration.toMap());
-    }
-    if (generation != null) {
-      await _invoke<void>('disable', {'generation': generation});
-    }
+    if (!_available || generation == null) return;
+    await _invoke<void>('disable', {'generation': generation});
   }
 
   NativeInkStrokeIdentity? registerStroke(PointerDownEvent event) {
@@ -403,14 +514,16 @@ class NativeInkBridge {
     return registration.identity;
   }
 
-  void markFinalStroke(
+  bool markFinalStroke(
     NativeInkStrokeIdentity identity,
     String elementId,
     int pointCount,
   ) {
-    if (!_enabled || !_handoff.markFinal(identity, elementId, pointCount)) {
-      unawaited(disable());
-    }
+    if (!_enabled) return false;
+    if (_handoff.markFinal(identity, elementId, pointCount)) return true;
+    // Native may have fallen back this stroke while retaining the arm.
+    _handoff.cancel(identity);
+    return false;
   }
 
   void cancelStroke(NativeInkStrokeIdentity identity) {
@@ -423,6 +536,7 @@ class NativeInkBridge {
   void acknowledgePaintedElements(
     Iterable<({String elementId, int? pointCount})> receipts,
   ) {
+    _retireForegrounds = false;
     if (!_enabled) return;
     for (final acknowledgement in _handoff.painted(receipts)) {
       unawaited(_invoke<void>('acknowledgeStroke', acknowledgement));
@@ -459,7 +573,7 @@ class NativeInkBridge {
     _available = false;
     _enabled = false;
     _controlEpoch++;
-    _handoff.clear();
+    _clearHandoff();
   }
 
   static bool _validRect(Rect rect) =>
