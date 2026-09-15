@@ -30,7 +30,7 @@ public final class LatencyLabActivity extends MainActivity {
     private static final String CHANNEL = "linwood.dev/butterfly/ink";
 
     private static final String PREDICTION_MS_EXTRA = "dev.linwood.butterfly.extra.PREDICTION_MS";
-    private static final int DEFAULT_PREDICTION_MS = 8;
+    private static final int DEFAULT_PREDICTION_MS = 20;
 
     private StylusLatencyMode.Value mode = StylusLatencyMode.DEFAULT;
     private int predictionMs = DEFAULT_PREDICTION_MS;

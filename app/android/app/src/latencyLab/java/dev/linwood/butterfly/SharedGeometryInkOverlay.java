@@ -8,7 +8,6 @@ import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.os.Build;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -39,6 +38,9 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private static final String TAG = "ButterflyInk";
     private static final int CHECKPOINT_POINTS = 16;
     private static final Executor DIRECT = Runnable::run;
+    // The predicted tail is drawn at this fraction of the stroke colour's full alpha so an
+    // over-running prediction reads visually as a hint, not committed ink.
+    static final float PREDICTED_TAIL_ALPHA_FRACTION = 0.45f;
 
     private enum Kind { STROKE, PREFLIGHT, ANDROIDX_CONTROL }
 
@@ -154,6 +156,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private final AtomicInteger pendingTransactions = new AtomicInteger();
     private final AtomicInteger pendingClear = new AtomicInteger();
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // Same colour as `paint` but at PREDICTED_TAIL_ALPHA_FRACTION alpha, so an
+    // over-running prediction reads as a hint rather than committed ink; kept as a
+    // separate Paint so the real tail stays fully opaque.
+    private final Paint predictedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     // Reused instead of allocating a Path per frame. Safe because every read/write of this field,
     // and of `engine`/`engineToken` below, happens inside the RendererCallback methods, which are
     // only ever invoked serially on the renderer's single dedicated background thread.
@@ -264,6 +270,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         handoff.setGeneration(generation);
         paint.setStyle(Paint.Style.FILL);
         paint.setColor(parsedPolicy.argb);
+        predictedPaint.setStyle(Paint.Style.FILL);
+        predictedPaint.setColor(predictedTailColor(parsedPolicy.argb));
         configured = true;
         return true;
     }
@@ -404,6 +412,29 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     /**
+     * The predicted tail's paint colour: {@code argb} at {@link #PREDICTED_TAIL_ALPHA_FRACTION}
+     * of full alpha instead of its own alpha channel. Policy colours are always fully opaque
+     * (enforced by {@link #parsePolicy}), so this only ever lowers alpha, never raises it.
+     * Package-visible and static so it is unit-testable without an Android runtime.
+     */
+    static int predictedTailColor(int argb) {
+        int alpha = Math.round(0xFF * PREDICTED_TAIL_ALPHA_FRACTION);
+        return (alpha << 24) | (argb & 0x00FFFFFF);
+    }
+
+    /**
+     * The absolute target time to hand {@link android.view.MotionPredictor#predict(long)}:
+     * {@code horizonMs} ahead of the latest real sample's own timestamp, in the same
+     * uptimeMillis-based nanosecond time base {@code predict()} expects -- not wall-clock 'now'
+     * at the moment prediction happens to run, which can drift from the event's timestamp under
+     * dispatch or GC jitter. Package-visible and static so it is unit-testable without an
+     * Android runtime.
+     */
+    static long predictionTimeNanos(long eventTimeMillis, int horizonMs) {
+        return (eventTimeMillis + horizonMs) * 1_000_000L;
+    }
+
+    /**
      * Records every filtered event into the motion predictor and, once per MOVE, asks it for one
      * predicted sample -- on API 34+ via the platform {@link android.view.MotionPredictor}
      * (wrapped in {@link PlatformPredictor} so that class is never loaded on lower API levels),
@@ -426,9 +457,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                         view.getContext());
                 platformPredictor.record(copy);
                 if (action != MotionEvent.ACTION_MOVE) return;
-                long predictionTimeNanos = SystemClock.uptimeNanos()
-                        + predictionHorizonMs * 1_000_000L;
-                prediction = platformPredictor.predict(predictionTimeNanos);
+                prediction = platformPredictor.predict(
+                        predictionTimeNanos(event.getEventTime(), predictionHorizonMs));
             } else {
                 if (predictor == null) predictor = MotionEventPredictor.newInstance(view);
                 predictor.record(copy);
@@ -957,8 +987,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
      * Draws only the outline entries the stroke's {@link PerfectFreehandGeometry.IncrementalOutline}
      * added for {@code snapshot.newPoints} (plus, while the engine is still settling, an
      * occasional small from-scratch redraw -- see {@link PerfectFreehandGeometry.IncrementalOutline}),
-     * never clearing once settled. A transient predicted tail, if any, is appended on top and is
-     * never retained by the engine, so the next real frame's tail naturally overdraws it.
+     * never clearing once settled. A transient predicted tail, if any, is appended on top in
+     * {@link #predictedPaint} (a lighter alpha than the real tail's opaque {@link #paint}) and is
+     * never retained by the engine, so the next real frame's tail naturally overdraws most of it.
+     * Any lighter 'shadow' pixels a direction change leaves beside the real stroke do not linger
+     * past the next {@link #CHECKPOINT_POINTS}-point checkpoint or stroke completion: both call
+     * {@link #drawFullOutline}, which clears the buffer and redraws only the engine's committed
+     * (non-predicted) geometry, so no per-frame clear is needed to keep the residual bounded.
      */
     private boolean drawFrontTail(Canvas canvas, Snapshot snapshot) {
         try {
@@ -975,7 +1010,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                         current.predictTail(snapshot.predicted);
                 if (!predictedTail.isEmpty()) {
                     PerfectFreehandGeometry.buildFilledQuadraticPath(predictedTail, scratchPath);
-                    canvas.drawPath(scratchPath, paint);
+                    canvas.drawPath(scratchPath, predictedPaint);
                 }
             }
             return true;
