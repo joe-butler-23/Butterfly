@@ -34,8 +34,31 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   }
 
   void _cancelNativeInk(int pointer) {
+    final wasNativeOwned = _nativeInkCancellers?.containsKey(pointer) ?? false;
     _nativeInkCancellers?.remove(pointer)?.call();
     _nativeInkFinalizers?.remove(pointer);
+    // The pointer's accumulated points may not have been painted by Flutter
+    // while native owned the stroke (see addPoint); now that ownership is
+    // gone, catch the foreground preview up in one refresh so ink doesn't
+    // appear to freeze or vanish.
+    if (wasNativeOwned && elements.containsKey(pointer)) {
+      unawaited(_bloc?.delayedRefreshForegroundsOnly());
+    }
+  }
+
+  bool _isNativeOwned(int pointer) =>
+      _nativeInkFinalizers?.containsKey(pointer) ?? false;
+
+  // Called by NativeInkBridge when native ink loses its arm mid-stroke
+  // (armChanged -> FLUTTER_ONLY, or a native failure). Every pointer native
+  // was drawing becomes Flutter-owned again immediately so addPoint resumes
+  // its per-move refresh, and _cancelNativeInk triggers one refresh now so
+  // the points already accumulated while native was drawing become visible.
+  void handleNativeInkArmLost() {
+    for (final pointer
+        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+      _cancelNativeInk(pointer);
+    }
   }
 
   // Create foregrounds for rendering the PenRendere
@@ -238,6 +261,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     bool shouldCreate = false,
   }) {
     final bloc = context.read<DocumentBloc>();
+    _bloc = bloc;
     final editorController = context.read<EditorController>();
     final transform = context.read<TransformCubit>().state;
     localPos = PointerManipulationHandler.calculatePointerPosition(
@@ -286,7 +310,16 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
         points: points,
       );
     }
-    if (refresh) unawaited(bloc.delayedRefreshForegroundsOnly());
+    // Native draws the wet stroke on its own overlay while it owns this
+    // pointer (see onPointerDown/_cancelNativeInk); repainting Flutter's own
+    // foreground preview on every move as well is redundant work that is
+    // invisible (native is on top) but competes for render-thread time.
+    // Skip it for as long as native still owns the stroke; the pointer-up
+    // path (refresh: false here) and _cancelNativeInk both still force a
+    // refresh so the dry stroke and any resumed preview are never missed.
+    if (refresh && !_isNativeOwned(pointer)) {
+      unawaited(bloc.delayedRefreshForegroundsOnly());
+    }
   }
 
   // This function is called when the pointer is pressed down.

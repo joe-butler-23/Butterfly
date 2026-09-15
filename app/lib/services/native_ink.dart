@@ -354,6 +354,7 @@ class NativeInkBridge {
         _pendingFrameCallback = null;
         _state = null;
         _clearHandoff();
+        _notifyArmLost();
       }
       return null;
     }
@@ -542,8 +543,21 @@ class NativeInkBridge {
     disarm(notifyNative: false);
     _clearHandoff();
     _state = null;
+    // Any pointer native was still drawing when this state was torn down
+    // (armChanged -> FLUTTER_ONLY, an ineligible reconfiguration, or
+    // dispose) needs Flutter to resume its own foreground preview so the
+    // stroke doesn't stall or vanish mid-draw.
+    _notifyArmLost();
     if (!_available || generation == null) return;
     await _invoke<void>('disable', {'generation': generation});
+  }
+
+  // Tells the PenHandler this bridge was last configured for (if any) that
+  // native ink ownership is gone for every pointer it was drawing. A no-op
+  // when there is no such pointer (e.g. disable() ran between strokes).
+  void _notifyArmLost() {
+    final handler = _lastRequest?.handler;
+    if (handler is PenHandler) handler.handleNativeInkArmLost();
   }
 
   NativeInkStrokeIdentity? registerStroke(PointerDownEvent event) {
