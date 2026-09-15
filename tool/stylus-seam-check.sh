@@ -9,6 +9,15 @@
 # ImageMagick `compare -metric AE`. If the "wet" stroke visibly settles/
 # redraws after lift (a seam), the AE counts are non-zero -> FAIL.
 #
+# Two extra gates catch a silent fallback to another (possibly
+# pixel-stable) mode, which would otherwise pass the AE check trivially:
+#   - logcat: `adb logcat -c` before the stroke, `adb logcat -d -s
+#     ButterflyInk:*` after the +2.5s capture; any line matching
+#     fallback|abort|failure|quarantine is a FAIL.
+#   - OCR (if `tesseract` is on PATH): the pen-tap and lift+0.3s toast
+#     crops are OCR'd and the word "fallback" is a FAIL. If tesseract is
+#     absent this gate is skipped (reported, not silently ignored).
+#
 # Usage:
 #   stylus-seam-check.sh MODE [STROKE_MS] [OUT_DIR]
 #
@@ -164,7 +173,14 @@ require_focus "pen-tool tap"
 adbs shell input tap "$PEN_TOOL_X" "$PEN_TOOL_Y"
 sleep 1
 
+SHOT_PEN="$OUT_DIR/shot_pen_tap.png"
+"$ADB" -s "$SERIAL" exec-out screencap -p > "$SHOT_PEN"
+
 require_focus "stylus stroke"
+
+# Clear the device log so the post-stroke ButterflyInk capture only reflects
+# this run's events.
+"$ADB" -s "$SERIAL" logcat -c
 
 # ---------------------------------------------------------------------------
 # 2. Draw one stroke, screenshot at 40%/80% through it and after lift
@@ -193,6 +209,14 @@ capture_at "$TPLUS25" "lift+2.5s"    "$SHOT_P25"
 
 wait "$SWIPE_PID" 2>/dev/null || true
 
+# Gate 1: any ButterflyInk log line reporting fallback/abort/failure/
+# quarantine during the run is an automatic FAIL, independent of pixels --
+# this is what catches a silent fallback to a mode that happens to be
+# pixel-stable (e.g. shared_geometry silently falling back to flutter_only).
+LOGCAT_OUT="$OUT_DIR/logcat_butterflyink.txt"
+"$ADB" -s "$SERIAL" logcat -d -s "ButterflyInk:*" > "$LOGCAT_OUT" 2>&1 || true
+LOGCAT_HITS="$(grep -iE 'fallback|abort|failure|quarantine' "$LOGCAT_OUT" || true)"
+
 # ---------------------------------------------------------------------------
 # 3. Crop stroke band / toast band, compute AE, build viewing artifacts
 # ---------------------------------------------------------------------------
@@ -202,6 +226,7 @@ CROP_STROKE_P1="$OUT_DIR/crop_stroke_plus1.0s.png"
 CROP_STROKE_P25="$OUT_DIR/crop_stroke_plus2.5s_dry.png"
 CROP_TOAST_40="$OUT_DIR/crop_toast_40pct.png"
 CROP_TOAST_LIFT="$OUT_DIR/crop_toast_lift_p0.3s.png"
+CROP_TOAST_PEN="$OUT_DIR/crop_toast_pen_tap.png"
 STACKED="$OUT_DIR/stacked_wet_vs_dry.png"
 
 crop "$SHOT_40"   "$STROKE_X0" "$STROKE_Y0" "$STROKE_X1" "$STROKE_Y1" "$CROP_STROKE_40"
@@ -211,6 +236,7 @@ crop "$SHOT_P25"  "$STROKE_X0" "$STROKE_Y0" "$STROKE_X1" "$STROKE_Y1" "$CROP_STR
 
 crop "$SHOT_40"   "$TOAST_X0" "$TOAST_Y0" "$TOAST_X1" "$TOAST_Y1" "$CROP_TOAST_40"
 crop "$SHOT_LIFT" "$TOAST_X0" "$TOAST_Y0" "$TOAST_X1" "$TOAST_Y1" "$CROP_TOAST_LIFT"
+crop "$SHOT_PEN"  "$TOAST_X0" "$TOAST_Y0" "$TOAST_X1" "$TOAST_Y1" "$CROP_TOAST_PEN"
 
 magick "$CROP_STROKE_40" "$CROP_STROKE_P25" -append "$STACKED"
 
@@ -219,11 +245,29 @@ AE_1_VS_25="$(ae_count "$CROP_STROKE_P1" "$CROP_STROKE_P25")"
 AE_LIFT_VS_25="${AE_LIFT_VS_25:-NA}"
 AE_1_VS_25="${AE_1_VS_25:-NA}"
 
+# Gate 2: OCR the toast crops and FAIL on the word "fallback". This is a
+# second, independent line of evidence against a mode that silently falls
+# back to another mode's (possibly pixel-stable) rendering path.
+OCR_FAIL=0
+OCR_PEN_TXT=""
+OCR_LIFT_TXT=""
+if command -v tesseract >/dev/null 2>&1; then
+  OCR_PEN_TXT="$(tesseract "$CROP_TOAST_PEN" - --psm 7 2>/dev/null || true)"
+  OCR_LIFT_TXT="$(tesseract "$CROP_TOAST_LIFT" - --psm 7 2>/dev/null || true)"
+  if echo "$OCR_PEN_TXT" | grep -qi 'fallback'; then OCR_FAIL=1; fi
+  if echo "$OCR_LIFT_TXT" | grep -qi 'fallback'; then OCR_FAIL=1; fi
+else
+  echo "OCR skipped: tesseract not found on PATH" >&2
+  OCR_PEN_TXT="(OCR skipped: tesseract not on PATH)"
+  OCR_LIFT_TXT="(OCR skipped: tesseract not on PATH)"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. Report
 # ---------------------------------------------------------------------------
 PASS=0
-if ae_is_zero "$AE_LIFT_VS_25" && ae_is_zero "$AE_1_VS_25"; then
+if ae_is_zero "$AE_LIFT_VS_25" && ae_is_zero "$AE_1_VS_25" \
+   && [[ -z "$LOGCAT_HITS" ]] && [[ "$OCR_FAIL" == "0" ]]; then
   PASS=1
 fi
 
@@ -241,11 +285,23 @@ fi
   echo "AE(lift+0.3s vs +2.5s): $AE_LIFT_VS_25"
   echo "AE(+1.0s     vs +2.5s): $AE_1_VS_25"
   echo "-------------------------------------------------------------------"
+  echo "logcat ButterflyInk (fallback|abort|failure|quarantine):"
+  if [[ -n "$LOGCAT_HITS" ]]; then
+    echo "$LOGCAT_HITS" | sed 's/^/  /'
+  else
+    echo "  none"
+  fi
+  echo "  full capture: $LOGCAT_OUT"
+  echo "-------------------------------------------------------------------"
+  echo "OCR (pen-tap toast):    $OCR_PEN_TXT"
+  echo "OCR (lift+0.3s toast):  $OCR_LIFT_TXT"
+  echo "-------------------------------------------------------------------"
   echo "crops:"
   echo "  stroke 40% (wet):        $CROP_STROKE_40"
   echo "  stroke lift+0.3s:        $CROP_STROKE_LIFT"
   echo "  stroke lift+1.0s:        $CROP_STROKE_P1"
   echo "  stroke lift+2.5s (dry):  $CROP_STROKE_P25"
+  echo "  toast @ pen tap:         $CROP_TOAST_PEN"
   echo "  toast @ 40%:             $CROP_TOAST_40"
   echo "  toast @ lift+0.3s:       $CROP_TOAST_LIFT"
   echo "  wet-vs-dry stacked:      $STACKED"
