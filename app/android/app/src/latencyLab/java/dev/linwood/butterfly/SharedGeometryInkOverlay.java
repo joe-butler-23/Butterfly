@@ -471,7 +471,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         drainedCount = 0;
         totalPointCount = 0;
         pendingPredicted = null;
-        Log.d(TAG, "stroke token=" + activeToken + " prediction horizon="
+        // Info level: the tablet drops debug lines globally (log.tag=I).
+        Log.i(TAG, "stroke token=" + activeToken + " prediction horizon="
                 + (predictionHorizonMs <= 0 ? "disabled" : predictionHorizonMs + "ms via "
                         + (usePlatformPredictor() ? "platform MotionPredictor"
                                 : "androidx MotionEventPredictor")));
