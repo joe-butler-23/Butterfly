@@ -27,7 +27,7 @@ import io.flutter.plugin.common.MethodChannel;
 public final class LatencyLabActivity extends MainActivity {
     private static final String CHANNEL = "linwood.dev/butterfly/ink";
 
-    private StylusLatencyMode.Value mode = StylusLatencyMode.Value.FLUTTER_ONLY;
+    private StylusLatencyMode.Value mode = StylusLatencyMode.DEFAULT;
     @Nullable private StylusWetInkRenderer wetInk;
     private long configuredGeneration = Long.MIN_VALUE;
     private boolean resumed, focused, multiWindow, pictureInPicture;
@@ -161,7 +161,7 @@ public final class LatencyLabActivity extends MainActivity {
         return content.getChildAt(content.getChildCount() - 1);
     }
 
-    /** The extra wins; otherwise the launcher alias's meta-data names the mode. */
+    /** The extra wins; otherwise the launcher runs the default mode. */
     private StylusLatencyMode.Value resolveMode(Intent intent) {
         String raw = intent.getStringExtra(StylusLatencyMode.EXTRA);
         if (raw == null) {

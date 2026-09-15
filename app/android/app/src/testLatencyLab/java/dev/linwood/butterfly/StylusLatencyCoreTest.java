@@ -8,7 +8,7 @@ import org.junit.Test;
 public class StylusLatencyCoreTest {
     @Test
     public void parsesOnlyTheFourLabModes() {
-        assertEquals(StylusLatencyMode.Value.FLUTTER_ONLY, StylusLatencyMode.parse(null));
+        assertEquals(StylusLatencyMode.Value.INK_PREDICTION_ON, StylusLatencyMode.parse(null));
         assertEquals(StylusLatencyMode.Value.FLUTTER_ONLY, StylusLatencyMode.parse("flutter_only"));
         assertEquals(StylusLatencyMode.Value.INK_PREDICTION_OFF,
                 StylusLatencyMode.parse("ink_prediction_off"));
@@ -16,7 +16,7 @@ public class StylusLatencyCoreTest {
                 StylusLatencyMode.parse("ink_prediction_on"));
         assertEquals(StylusLatencyMode.Value.SHARED_GEOMETRY,
                 StylusLatencyMode.parse("shared_geometry"));
-        assertEquals(StylusLatencyMode.Value.FLUTTER_ONLY, StylusLatencyMode.parse("unknown"));
+        assertEquals(StylusLatencyMode.Value.INK_PREDICTION_ON, StylusLatencyMode.parse("unknown"));
     }
 
     @Test
