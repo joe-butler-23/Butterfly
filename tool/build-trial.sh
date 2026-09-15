@@ -11,7 +11,7 @@ if ! flock -w 1800 9; then echo "another build holds $lock" >&2; exit 75; fi
 cd "$repo/app"
 # The agent-workloads slice caps memory (6G high / 8G max) and swap, so a
 # runaway build is killed before it can throttle the whole user session.
-systemd-run --user --scope --quiet --wait --collect \
+systemd-run --user --scope --quiet \
   --slice=agent-workloads.slice --unit="butterfly-build-$$" -p CPUWeight=50 \
   nix shell nixpkgs#jdk21 -c \
   flutter build apk --flavor latencyLab --release --target-platform android-arm64 "$@"
