@@ -37,6 +37,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private static final String TAG = "ButterflyInk";
     private static final int CHECKPOINT_POINTS = 16;
+    // Extra padding, beyond the policy stroke width, on the local rect drawCheckpointDelta clips
+    // and clears at each checkpoint: covers antialiasing bleed at the fragment's edge so no
+    // fractional-alpha fringe from the previous checkpoint's draw survives just outside it.
+    private static final float CHECKPOINT_CLEAR_MARGIN_PX = 4f;
     private static final Executor DIRECT = Runnable::run;
     // The predicted tail is drawn at this fraction of the stroke colour's full alpha so an
     // over-running prediction reads visually as a hint, not committed ink.
@@ -870,7 +874,12 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                         + " snapshotNull=" + (last.snapshot == null));
                 return;
             }
-            boolean success = drawFullOutline(canvas, last.snapshot);
+            // A live checkpoint only ever needs to add what changed since the previous one (see
+            // drawCheckpointDelta); only stroke completion -- once per stroke, off the 60Hz input
+            // path -- pays for the exact, whole-outline redraw.
+            boolean success = last.snapshot.complete
+                    ? drawFullOutline(canvas, last.snapshot)
+                    : drawCheckpointDelta(canvas, last.snapshot);
             multiCallbacks.add(new CallbackRecord(last.snapshot, Kind.STROKE,
                     last.generation, last.readinessEpoch, success));
         }
@@ -991,9 +1000,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
      * {@link #predictedPaint} (a lighter alpha than the real tail's opaque {@link #paint}) and is
      * never retained by the engine, so the next real frame's tail naturally overdraws most of it.
      * Any lighter 'shadow' pixels a direction change leaves beside the real stroke do not linger
-     * past the next {@link #CHECKPOINT_POINTS}-point checkpoint or stroke completion: both call
-     * {@link #drawFullOutline}, which clears the buffer and redraws only the engine's committed
-     * (non-predicted) geometry, so no per-frame clear is needed to keep the residual bounded.
+     * past the next {@link #CHECKPOINT_POINTS}-point checkpoint or stroke completion: the former
+     * calls {@link #drawCheckpointDelta} and the latter {@link #drawFullOutline}, and either way
+     * only the engine's committed (non-predicted) geometry reaches the multi-buffered layer, so
+     * no per-frame clear is needed here to keep the residual bounded.
      */
     private boolean drawFrontTail(Canvas canvas, Snapshot snapshot) {
         try {
@@ -1021,9 +1031,12 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     /**
-     * The multi-buffered (checkpoint/completion) draw: the exact full outline, from the same
-     * engine's own accumulated state -- proven equal to a from-scratch computation by
-     * {@code PerfectFreehandGeometryParityTest} -- rather than a separate recompute.
+     * The multi-buffered stroke-completion draw: the exact full outline, from the same engine's
+     * own accumulated state -- proven equal to a from-scratch computation by
+     * {@code PerfectFreehandGeometryParityTest} -- rather than a separate recompute. Only reached
+     * for {@code snapshot.complete} (see {@link RendererCallback#onDrawMultiBufferedLayer}): a
+     * single draw at pen lift, off the 60Hz input path, so paying for the whole shape here is
+     * fine. A live checkpoint instead calls {@link #drawCheckpointDelta}.
      */
     private boolean drawFullOutline(Canvas canvas, Snapshot snapshot) {
         try {
@@ -1035,6 +1048,59 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             return true;
         } catch (RuntimeException | LinkageError error) {
             postFailure("drawFullOutline threw for token=" + snapshot.token, error);
+            return false;
+        }
+    }
+
+    /**
+     * The multi-buffered per-checkpoint draw: unlike {@link #drawFullOutline}, this only clears
+     * and redraws the rectangle bounding whatever changed since the previous checkpoint --
+     * {@link PerfectFreehandGeometry.IncrementalOutline#checkpointTail()}'s fragment, unioned
+     * with the current predicted tail's bounds (defensive: the predicted tail is never itself
+     * drawn to this layer, but this keeps the region this layer clears at a checkpoint consistent
+     * with what a full redraw would have cleared there) -- padded by the stroke width and a small
+     * anti-aliasing margin. Everything outside that rectangle is left untouched via
+     * {@link Canvas#clipRect}, which is what keeps this cheap: cost is bounded by one checkpoint
+     * interval's geometry, never by the whole stroke, so this -- not {@link #drawFullOutline} --
+     * is what runs on the input path of a live stroke.
+     *
+     * <p>Correctness relies on the persistent multi-buffered layer never being cleared as a
+     * whole between checkpoints of the same stroke (only {@link #drawFullOutline}, at stroke
+     * completion, and the clear issued once a stroke's ink is fully handed off do that): each
+     * checkpoint only ever adds its own delta on top of what earlier checkpoints already drew,
+     * so the layer accumulates to exactly the same image {@link #drawFullOutline} would have
+     * produced from scratch -- proven by {@code
+     * PerfectFreehandGeometryParityTest#checkpointTailUnionMatchesFullOutlineForLongFixture}.
+     */
+    private boolean drawCheckpointDelta(Canvas canvas, Snapshot snapshot) {
+        try {
+            PerfectFreehandGeometry.IncrementalOutline current = engineFor(snapshot);
+            List<PerfectFreehandGeometry.Point> tail = current.checkpointTail();
+            PerfectFreehandGeometry.Bounds bounds = PerfectFreehandGeometry.boundsOf(tail);
+            if (snapshot.predicted != null) {
+                PerfectFreehandGeometry.Bounds predictedBounds = PerfectFreehandGeometry.boundsOf(
+                        current.predictTail(snapshot.predicted));
+                if (predictedBounds != null) {
+                    bounds = bounds == null ? predictedBounds : bounds.union(predictedBounds);
+                }
+            }
+            if (bounds == null) return true; // nothing changed since the last checkpoint.
+            bounds = bounds.padded(snapshot.policy.width + CHECKPOINT_CLEAR_MARGIN_PX);
+            canvas.save();
+            try {
+                canvas.clipRect((float) bounds.left, (float) bounds.top,
+                        (float) bounds.right, (float) bounds.bottom);
+                canvas.drawColor(0, BlendMode.CLEAR);
+                if (!tail.isEmpty()) {
+                    PerfectFreehandGeometry.buildFilledQuadraticPath(tail, scratchPath);
+                    canvas.drawPath(scratchPath, paint);
+                }
+            } finally {
+                canvas.restore();
+            }
+            return true;
+        } catch (RuntimeException | LinkageError error) {
+            postFailure("drawCheckpointDelta threw for token=" + snapshot.token, error);
             return false;
         }
     }
