@@ -139,22 +139,23 @@ void main() {
 
       expect(bridge.markFinalStroke(identity, 'element-1', 3), isTrue);
 
-      // An identity that was never registered with this bridge.
+      // An identity that was never registered with this bridge: nothing to
+      // cancel on either side.
       const unknown = (
         generation: 999,
         strokeSequence: 999,
         sourceTimestampUs: 0,
       );
       calls.clear();
-      expect(bridge.markFinalStroke(unknown, 'element-2', 3), isFalse);
-      // NOTE: markFinalStroke's fallback calls the private _Handoff.cancel
-      // directly (native_ink.dart:589) instead of the public cancelStroke()
-      // method (native_ink.dart:593-598), so no channel invocation is made
-      // for an unmatched identity. This looks like a bug (native is never
-      // told to drop a stroke it may still be tracking) but is the actual,
-      // current behaviour, so this test asserts what the code does rather
-      // than what the docstring comment implies it should do.
+      expect(bridge.markFinalStroke(unknown, element-2, 3), isFalse);
       expect(calls, isEmpty);
+
+      // A registered stroke that cannot be finalised (a one-point dot) is
+      // cancelled on both sides so native drops its wet stroke too.
+      final dot = bridge.registerStroke(pointerDown(pointer: 2))!;
+      calls.clear();
+      expect(bridge.markFinalStroke(dot, element-3, 1), isFalse);
+      expect(calls.where((c) => c.method == cancelStroke), hasLength(1));
     },
   );
 

@@ -585,8 +585,9 @@ class NativeInkBridge {
   ) {
     if (!_enabled) return false;
     if (_handoff.markFinal(identity, elementId, pointCount)) return true;
-    // Native may have fallen back this stroke while retaining the arm.
-    _handoff.cancel(identity);
+    // Unfinalisable (a one-point dot, or a conflicting second final): drop
+    // it on both sides so native does not keep the wet stroke.
+    cancelStroke(identity);
     return false;
   }
 
