@@ -4,6 +4,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Display;
 import android.view.MotionEvent;
 import android.view.View;
@@ -25,6 +26,7 @@ import io.flutter.plugin.common.MethodChannel;
 
 /** Isolated Activity used only by the latencyLab flavor. */
 public final class LatencyLabActivity extends MainActivity {
+    private static final String TAG = "ButterflyInk";
     private static final String CHANNEL = "linwood.dev/butterfly/ink";
 
     private StylusLatencyMode.Value mode = StylusLatencyMode.DEFAULT;
@@ -54,6 +56,8 @@ public final class LatencyLabActivity extends MainActivity {
                             // that arrives before onResume is retried by Dart, not a failure.
                             if (!configured && resumed
                                     && mode != StylusLatencyMode.Value.FLUTTER_ONLY) {
+                                Log.w(TAG, "configure: configureWetInk() returned false, mode="
+                                        + mode);
                                 showFallbackSignal();
                             }
                             result.success(configured);
@@ -99,12 +103,17 @@ public final class LatencyLabActivity extends MainActivity {
             renderer.setFailureCallback(
                     generation -> onRendererFailure(renderer, generation));
             if (!renderer.configure(arguments)) {
+                Log.w(TAG, "configureWetInk: renderer.configure() returned false, mode=" + mode);
                 destroyWetInk();
                 return false;
             }
             configuredGeneration = generation(arguments);
+            if (configuredGeneration == Long.MIN_VALUE) {
+                Log.w(TAG, "configureWetInk: arguments carried no usable generation");
+            }
             return configuredGeneration != Long.MIN_VALUE;
         } catch (RuntimeException | LinkageError error) {
+            Log.w(TAG, "configureWetInk threw", error);
             destroyWetInk();
             return false;
         }
@@ -115,6 +124,9 @@ public final class LatencyLabActivity extends MainActivity {
             StylusWetInkRenderer renderer = wetInk;
             if (renderer == null || !resumed || !matchesConfiguredGeneration(arguments)
                     || !renderer.enable(arguments) || !attach(renderer)) {
+                Log.w(TAG, "enableWetInk: preconditions failed, rendererNull="
+                        + (renderer == null) + " resumed=" + resumed + " generationMatch="
+                        + matchesConfiguredGeneration(arguments));
                 destroyWetInk();
                 result.success(false);
                 showFallbackSignal();
@@ -122,6 +134,8 @@ public final class LatencyLabActivity extends MainActivity {
             }
             if (!renderer.attachAndPrewarm()) {
                 boolean failureAlreadySignaled = renderer != wetInk;
+                Log.w(TAG, "enableWetInk: attachAndPrewarm() returned false, "
+                        + "failureAlreadySignaled=" + failureAlreadySignaled);
                 destroyWetInk();
                 result.success(false);
                 if (!failureAlreadySignaled) showFallbackSignal();
@@ -130,6 +144,9 @@ public final class LatencyLabActivity extends MainActivity {
             renderer.awaitActivation(enabled -> {
                 boolean accepted = enabled && renderer == wetInk && resumed;
                 if (!accepted) {
+                    Log.w(TAG, "enableWetInk: activation rejected, enabled=" + enabled
+                            + " rendererStillCurrent=" + (renderer == wetInk) + " resumed="
+                            + resumed);
                     destroyWetInk();
                     showFallbackSignal();
                 } else {
@@ -138,6 +155,7 @@ public final class LatencyLabActivity extends MainActivity {
                 result.success(accepted);
             });
         } catch (RuntimeException | LinkageError error) {
+            Log.w(TAG, "enableWetInk threw", error);
             destroyWetInk();
             showFallbackSignal();
             result.success(false);
@@ -239,7 +257,14 @@ public final class LatencyLabActivity extends MainActivity {
 
     private void onRendererFailure(StylusWetInkRenderer renderer, long failureGeneration) {
         runOnUiThread(() -> {
-            if (renderer != wetInk || failureGeneration != configuredGeneration) return;
+            if (renderer != wetInk || failureGeneration != configuredGeneration) {
+                Log.w(TAG, "onRendererFailure: stale callback ignored, generation="
+                        + failureGeneration + " configuredGeneration=" + configuredGeneration
+                        + " rendererStillCurrent=" + (renderer == wetInk));
+                return;
+            }
+            Log.w(TAG, "onRendererFailure: FailureCallback.onFailure fired, generation="
+                    + failureGeneration + " mode=" + mode);
             destroyWetInk();
             showFallbackSignal();
             MethodChannel currentChannel = channel;
