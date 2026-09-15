@@ -147,15 +147,15 @@ void main() {
         sourceTimestampUs: 0,
       );
       calls.clear();
-      expect(bridge.markFinalStroke(unknown, element-2, 3), isFalse);
+      expect(bridge.markFinalStroke(unknown, 'element-2', 3), isFalse);
       expect(calls, isEmpty);
 
       // A registered stroke that cannot be finalised (a one-point dot) is
       // cancelled on both sides so native drops its wet stroke too.
       final dot = bridge.registerStroke(pointerDown(pointer: 2))!;
       calls.clear();
-      expect(bridge.markFinalStroke(dot, element-3, 1), isFalse);
-      expect(calls.where((c) => c.method == cancelStroke), hasLength(1));
+      expect(bridge.markFinalStroke(dot, 'element-3', 1), isFalse);
+      expect(calls.where((c) => c.method == 'cancelStroke'), hasLength(1));
     },
   );
 
