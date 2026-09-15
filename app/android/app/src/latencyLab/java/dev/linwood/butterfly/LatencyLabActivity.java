@@ -29,7 +29,11 @@ public final class LatencyLabActivity extends MainActivity {
     private static final String TAG = "ButterflyInk";
     private static final String CHANNEL = "linwood.dev/butterfly/ink";
 
+    private static final String PREDICTION_MS_EXTRA = "dev.linwood.butterfly.extra.PREDICTION_MS";
+    private static final int DEFAULT_PREDICTION_MS = 8;
+
     private StylusLatencyMode.Value mode = StylusLatencyMode.DEFAULT;
+    private int predictionMs = DEFAULT_PREDICTION_MS;
     @Nullable private StylusWetInkRenderer wetInk;
     private long configuredGeneration = Long.MIN_VALUE;
     private boolean resumed, focused, multiWindow, pictureInPicture;
@@ -38,6 +42,7 @@ public final class LatencyLabActivity extends MainActivity {
 
     @Override protected void onCreate(@Nullable Bundle savedInstanceState) {
         mode = resolveMode(getIntent());
+        predictionMs = resolvePredictionMs(getIntent());
         super.onCreate(savedInstanceState);
         showRequestedSignal();
         if (mode == StylusLatencyMode.Value.FLUTTER_ONLY) showActiveSignal();
@@ -49,6 +54,7 @@ public final class LatencyLabActivity extends MainActivity {
         super.configureFlutterEngine(engine);
         channel = new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL);
         channel.setMethodCallHandler((call, result) -> {
+                    Log.d(TAG, "channel: " + call.method + " mode=" + mode + " resumed=" + resumed);
                     switch (call.method) {
                         case "configure" -> {
                             boolean configured = configureWetInk(call.arguments);
@@ -93,7 +99,8 @@ public final class LatencyLabActivity extends MainActivity {
             View flutterView = flutterView();
             if (flutterView == null) return false;
             wetInk = switch (mode) {
-                case SHARED_GEOMETRY -> new SharedGeometryInkOverlay(this, flutterView);
+                case SHARED_GEOMETRY -> new SharedGeometryInkOverlay(this, flutterView,
+                        predictionMs);
                 default -> null;
             };
             StylusWetInkRenderer renderer = wetInk;
@@ -192,10 +199,22 @@ public final class LatencyLabActivity extends MainActivity {
         return StylusLatencyMode.parse(raw);
     }
 
+    /**
+     * Milliseconds of motion prediction to request from the wet-ink overlay; 0 disables
+     * prediction. Unset (extra absent) falls back to {@link #DEFAULT_PREDICTION_MS}; a
+     * non-integer or unparsable extra also falls back to the default rather than crashing.
+     */
+    private int resolvePredictionMs(Intent intent) {
+        if (!intent.hasExtra(PREDICTION_MS_EXTRA)) return DEFAULT_PREDICTION_MS;
+        int value = intent.getIntExtra(PREDICTION_MS_EXTRA, DEFAULT_PREDICTION_MS);
+        return Math.max(0, value);
+    }
+
     @Override protected void onNewIntent(@NonNull Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
         mode = resolveMode(intent);
+        predictionMs = resolvePredictionMs(intent);
         destroyWetInk();
         requestedSignalShown = false;
         showRequestedSignal();

@@ -8,10 +8,12 @@ import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.MotionPredictor;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -167,6 +169,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Nullable private ActivationCallback activationCallback;
     @Nullable private FailureCallback failureCallback;
     @Nullable private MotionEventPredictor predictor;
+    @Nullable private PlatformPredictor platformPredictor;
     @Nullable private PerfectFreehandGeometry.Point pendingPredicted;
     private boolean drainPosted, frontRenderOutstanding;
     private boolean configured, enabled, attached, surfaceReady, rendererControlReady, ready;
@@ -184,9 +187,28 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     // appendEvent and the checkpoint cadence below both need the stroke-wide count, not the size
     // of that trimmed buffer.
     private int totalPointCount;
+    // Milliseconds of motion prediction to request; 0 disables prediction entirely. Read once
+    // from the activity intent's PREDICTION_MS extra and fixed for this overlay's lifetime.
+    private final int predictionHorizonMs;
 
-    SharedGeometryInkOverlay(Context context, View flutterInputView) {
+    /**
+     * Isolates the API 34 android.view.MotionPredictor reference in its own class so that class
+     * is only loaded/verified when actually instantiated on SDK_INT >= 34 (see usePlatformPredictor()
+     * below); on lower API levels {@link #predictor}, the androidx MotionEventPredictor, is used
+     * instead and this class is never touched.
+     */
+    private static final class PlatformPredictor {
+        private final MotionPredictor predictor;
+        PlatformPredictor(Context context) { predictor = new MotionPredictor(context); }
+        void record(MotionEvent event) { predictor.record(event); }
+        @Nullable MotionEvent predict(long predictionTimeNanos) {
+            return predictor.predict(predictionTimeNanos);
+        }
+    }
+
+    SharedGeometryInkOverlay(Context context, View flutterInputView, int predictionMs) {
         this.flutterInputView = flutterInputView;
+        this.predictionHorizonMs = Math.max(0, predictionMs);
         view = new SurfaceView(context);
         view.setZOrderOnTop(true);
         view.getHolder().setFormat(PixelFormat.TRANSLUCENT);
@@ -366,6 +388,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 } else if (appendEvent(event, index, true, locationX, locationY)) {
                     activePointer = -1;
                     predictor = null;
+                    platformPredictor = null;
                 } else {
                     abortStroke("appendEvent rejected the final UP sample (non-finite coordinate)");
                 }
@@ -376,23 +399,42 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
     }
 
+    private boolean usePlatformPredictor() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+    }
+
     /**
      * Records every filtered event into the motion predictor and, once per MOVE, asks it for one
-     * predicted sample. The prediction is
+     * predicted sample -- on API 34+ via the platform {@link android.view.MotionPredictor}
+     * (wrapped in {@link PlatformPredictor} so that class is never loaded on lower API levels),
+     * and on older devices via the androidx {@link MotionEventPredictor} fallback. A horizon of
+     * 0 (see {@link #predictionHorizonMs}) disables prediction outright: neither predictor is
+     * ever touched and {@link #pendingPredicted} is never set. Either way the prediction is
      * staged as a transient point that {@link #drainLatest} attaches to the next front-buffer
      * draw and that is never added to {@link #points}, so a wrong guess can only ever affect one
      * frame's pixels, not the stroke's persisted geometry.
      */
     private void recordPrediction(MotionEvent event, int action, float locationX, float locationY) {
+        if (predictionHorizonMs <= 0) return;
         MotionEvent copy = null;
         MotionEvent prediction = null;
         try {
-            if (predictor == null) predictor = MotionEventPredictor.newInstance(view);
             copy = MotionEvent.obtain(event);
             copy.offsetLocation(-locationX, -locationY);
-            predictor.record(copy);
-            if (action != MotionEvent.ACTION_MOVE) return;
-            prediction = predictor.predict();
+            if (usePlatformPredictor()) {
+                if (platformPredictor == null) platformPredictor = new PlatformPredictor(
+                        view.getContext());
+                platformPredictor.record(copy);
+                if (action != MotionEvent.ACTION_MOVE) return;
+                long predictionTimeNanos = SystemClock.uptimeNanos()
+                        + predictionHorizonMs * 1_000_000L;
+                prediction = platformPredictor.predict(predictionTimeNanos);
+            } else {
+                if (predictor == null) predictor = MotionEventPredictor.newInstance(view);
+                predictor.record(copy);
+                if (action != MotionEvent.ACTION_MOVE) return;
+                prediction = predictor.predict();
+            }
             if (prediction == null) return;
             float x = prediction.getX(0);
             float y = prediction.getY(0);
@@ -408,6 +450,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             // Prediction is a purely cosmetic latency hint; a device/library quirk here should
             // not take down the whole overlay the way a geometry failure does.
             predictor = null;
+            platformPredictor = null;
         } finally {
             if (copy != null) copy.recycle();
             if (prediction != null) prediction.recycle();
@@ -428,6 +471,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         drainedCount = 0;
         totalPointCount = 0;
         pendingPredicted = null;
+        Log.d(TAG, "stroke token=" + activeToken + " prediction horizon="
+                + (predictionHorizonMs <= 0 ? "disabled" : predictionHorizonMs + "ms via "
+                        + (usePlatformPredictor() ? "platform MotionPredictor"
+                                : "androidx MotionEventPredictor")));
         // retainedCount() == 0 was just checked above, so this insert can never overflow
         // the bounded map; there is no per-token buffer here to clear if it somehow did.
         handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, activeToken);
@@ -623,6 +670,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         totalPointCount = 0;
         pendingPredicted = null;
         predictor = null;
+        platformPredictor = null;
         pendingSnapshot = null;
         if (token == Long.MIN_VALUE) return;
         handoff.cancelNative(token);
@@ -741,6 +789,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         totalPointCount = 0;
         pendingPredicted = null;
         predictor = null;
+        platformPredictor = null;
         handoff.clear();
         resolveActivation(false);
         view.setVisibility(View.INVISIBLE);
