@@ -93,8 +93,6 @@ public final class LatencyLabActivity extends MainActivity {
             View flutterView = flutterView();
             if (flutterView == null) return false;
             wetInk = switch (mode) {
-                case INK_PREDICTION_OFF -> new InkLatencyOverlay(this, flutterView, false);
-                case INK_PREDICTION_ON -> new InkLatencyOverlay(this, flutterView, true);
                 case SHARED_GEOMETRY -> new SharedGeometryInkOverlay(this, flutterView);
                 default -> null;
             };

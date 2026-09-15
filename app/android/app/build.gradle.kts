@@ -117,9 +117,6 @@ flutter {
 
 dependencies {
     add("latencyLabImplementation", "androidx.graphics:graphics-core:1.0.4")
-    add("latencyLabImplementation", "androidx.ink:ink-authoring:1.0.0")
-    add("latencyLabImplementation", "androidx.ink:ink-brush:1.0.0")
-    add("latencyLabImplementation", "androidx.ink:ink-strokes:1.0.0")
     add("latencyLabImplementation", "androidx.input:input-motionprediction:1.0.0")
 
     add("testLatencyLabImplementation", "junit:junit:4.13.2")

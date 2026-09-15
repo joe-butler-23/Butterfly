@@ -378,7 +378,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     /**
      * Records every filtered event into the motion predictor and, once per MOVE, asks it for one
-     * predicted sample -- exactly the pattern {@code InkLatencyOverlay} uses. The prediction is
+     * predicted sample. The prediction is
      * staged as a transient point that {@link #drainLatest} attaches to the next front-buffer
      * draw and that is never added to {@link #points}, so a wrong guess can only ever affect one
      * frame's pixels, not the stroke's persisted geometry.
