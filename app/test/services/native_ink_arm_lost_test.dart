@@ -14,8 +14,6 @@
 // test/handlers/pen_native_ink_test.dart), which is unnecessary just to
 // prove the bridge calls handleNativeInkArmLost() on the right handler at
 // the right time.
-import 'dart:async';
-
 import 'package:butterfly/cubits/settings.dart';
 import 'package:butterfly/cubits/transform.dart';
 import 'package:butterfly/handlers/handler.dart';
@@ -49,6 +47,7 @@ void main() {
       switch (call.method) {
         case 'configure':
         case 'enable':
+        case 'registerStroke':
           return true;
         default:
           return null;
@@ -71,51 +70,87 @@ void main() {
         .handlePlatformMessage(_testChannel.name, message, (_) {});
   }
 
-  Future<NativeInkState?> arm(NativeInkBridge bridge, Handler handler) =>
-      bridge.updateState(
-        handler: handler,
-        settings: const ButterflySettings(autosave: false),
-        canvasBounds: const Rect.fromLTWH(0, 0, 100, 100),
-        devicePixelRatio: 1,
-        camera: const CameraTransform(),
-      );
-
-  test(
-    'armChanged -> FLUTTER_ONLY calls handleNativeInkArmLost on the last '
-    'configured PenHandler',
-    () async {
-      final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
-      final handler = _RecordingPenHandler(PenTool(id: 'pen'));
-      final state = await arm(bridge, handler);
-      expect(state, isNotNull);
-      expect(bridge.enabled, isTrue);
-
-      await deliverIncoming('armChanged', 'FLUTTER_ONLY');
-      // disable() awaits an async invoke to native before returning, but
-      // _notifyArmLost runs synchronously before that await.
-      expect(handler.armLostCalls, 1);
-      expect(bridge.enabled, isFalse);
-    },
+  Future<NativeInkState?> arm(
+    NativeInkBridge bridge,
+    Handler handler, {
+    Rect canvasBounds = const Rect.fromLTWH(0, 0, 100, 100),
+  }) => bridge.updateState(
+    handler: handler,
+    settings: const ButterflySettings(autosave: false),
+    canvasBounds: canvasBounds,
+    devicePixelRatio: 1,
+    camera: const CameraTransform(),
   );
 
+  test('armChanged -> FLUTTER_ONLY calls handleNativeInkArmLost on the last '
+      'configured PenHandler', () async {
+    final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
+    final handler = _RecordingPenHandler(PenTool(id: 'pen'));
+    final state = await arm(bridge, handler);
+    expect(state, isNotNull);
+    expect(bridge.enabled, isTrue);
+
+    await deliverIncoming('armChanged', 'FLUTTER_ONLY');
+    // disable() awaits an async invoke to native before returning, but
+    // _notifyArmLost runs synchronously before that await.
+    expect(handler.armLostCalls, 1);
+    expect(bridge.enabled, isFalse);
+  });
+
+  test('a nativeFailure for the current generation calls '
+      'handleNativeInkArmLost on the last configured PenHandler', () async {
+    final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
+    final handler = _RecordingPenHandler(PenTool(id: 'pen'));
+    final state = await arm(bridge, handler);
+    expect(state, isNotNull);
+    final identity = (await bridge.registerStroke(
+      PointerDownEvent(pointer: 1, timeStamp: Duration.zero),
+    ))!;
+
+    await deliverIncoming('nativeFailure', state!.generation);
+    expect(handler.armLostCalls, 1);
+    expect(bridge.enabled, isFalse);
+    expect(bridge.markFinalStroke(identity, 'failed', 2), isFalse);
+
+    // A failure reported again for the same (now-stale, already-cleared)
+    // generation is ignored by the existing generation check, so it must
+    // not notify the handler a second time.
+    await deliverIncoming('nativeFailure', state.generation);
+    expect(handler.armLostCalls, 1);
+  });
+
   test(
-    'a nativeFailure for the current generation calls '
-    'handleNativeInkArmLost on the last configured PenHandler',
+    'disarm and successful reconfiguration release the current owner',
     () async {
       final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
       final handler = _RecordingPenHandler(PenTool(id: 'pen'));
-      final state = await arm(bridge, handler);
-      expect(state, isNotNull);
+      await arm(bridge, handler);
+      final identity = (await bridge.registerStroke(
+        PointerDownEvent(pointer: 2, timeStamp: Duration.zero),
+      ))!;
 
-      await deliverIncoming('nativeFailure', state!.generation);
+      bridge.disarm(notifyNative: false);
       expect(handler.armLostCalls, 1);
-      expect(bridge.enabled, isFalse);
+      expect(bridge.markFinalStroke(identity, 'disarmed', 2), isFalse);
 
-      // A failure reported again for the same (now-stale, already-cleared)
-      // generation is ignored by the existing generation check, so it must
-      // not notify the handler a second time.
-      await deliverIncoming('nativeFailure', state.generation);
-      expect(handler.armLostCalls, 1);
+      await arm(
+        bridge,
+        handler,
+        canvasBounds: const Rect.fromLTWH(0, 0, 200, 100),
+      );
+      final nextIdentity = (await bridge.registerStroke(
+        PointerDownEvent(
+          pointer: 3,
+          timeStamp: const Duration(microseconds: 3),
+        ),
+      ))!;
+      await arm(
+        bridge,
+        handler,
+        canvasBounds: const Rect.fromLTWH(0, 0, 300, 100),
+      );
+      expect(handler.armLostCalls, 2);
+      expect(bridge.markFinalStroke(nextIdentity, 'reconfigured', 2), isFalse);
     },
   );
 

@@ -1,7 +1,9 @@
 package dev.linwood.butterfly;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -66,8 +68,21 @@ public class StylusLatencyCoreTest {
         handoff.setGeneration(7);
         handoff.addNativeStroke(7, 10_000, "stroke");
         handoff.cancelNative("stroke");
-        handoff.register(7, 10_000);
+        assertFalse(handoff.register(7, 10_000));
         assertNull(handoff.acknowledge(7, 10_000, "element", 3));
+    }
+
+    @Test
+    public void registrationAcceptsOnlyTheExactLiveNativeStroke() {
+        InkHandoffCoordinator<String> handoff = new InkHandoffCoordinator<>();
+        handoff.setGeneration(7);
+        assertFalse(handoff.register(7, 10_000));
+        handoff.addNativeStroke(7, 10_000, "stroke");
+        assertFalse(handoff.register(8, 10_000));
+        assertFalse(handoff.register(7, 11_000));
+        assertTrue(handoff.register(7, 10_000));
+        handoff.cancelNative("stroke");
+        assertFalse(handoff.register(7, 10_000));
     }
 
     @Test

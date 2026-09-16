@@ -139,9 +139,11 @@ class _Registration {
 }
 
 class _Stroke {
-  _Stroke(this.registration);
+  _Stroke(this.registration, this.owner);
 
   final _Registration registration;
+  final PenHandler? owner;
+  bool accepted = false;
   String? finalElementId;
   int? finalPointCount;
 }
@@ -151,16 +153,24 @@ class _Handoff {
   final Map<int, _Stroke> _activeByPointer = {};
   final Map<int, _Stroke> _bySequence = {};
   final List<_Stroke> _ordered = [];
-  final List<_Registration> _retired = [];
+  final List<_Stroke> _retired = [];
   int _nextSequence = 0;
   bool overflowed = false;
 
   bool get hasFinals => _ordered.any((stroke) => stroke.finalElementId != null);
 
+  bool get hasStrokes => _ordered.isNotEmpty || _retired.isNotEmpty;
+
+  Set<PenHandler> owners() => {
+    for (final stroke in [..._ordered, ..._retired])
+      if (stroke.owner != null) stroke.owner!,
+  };
+
   _Registration register({
     required int generation,
     required int pointer,
     required int sourceTimestampUs,
+    PenHandler? owner,
   }) {
     final previous = _activeByPointer.remove(pointer);
     if (previous != null) _retire(previous);
@@ -169,7 +179,7 @@ class _Handoff {
       strokeSequence: ++_nextSequence,
       sourceTimestampUs: sourceTimestampUs,
     ), pointer);
-    final stroke = _Stroke(registration);
+    final stroke = _Stroke(registration, owner);
     _activeByPointer[pointer] = stroke;
     _bySequence[registration.identity.strokeSequence] = stroke;
     _ordered.add(stroke);
@@ -180,13 +190,28 @@ class _Handoff {
     return registration;
   }
 
+  bool contains(NativeInkStrokeIdentity identity) =>
+      _matching(identity) != null;
+
+  bool markAccepted(NativeInkStrokeIdentity identity) {
+    final stroke = _matching(identity);
+    if (stroke == null) return false;
+    stroke.accepted = true;
+    return true;
+  }
+
   bool markFinal(
     NativeInkStrokeIdentity identity,
     String elementId,
     int pointCount,
   ) {
     final stroke = _matching(identity);
-    if (stroke == null || elementId.isEmpty || pointCount <= 1) return false;
+    if (stroke == null ||
+        !stroke.accepted ||
+        elementId.isEmpty ||
+        pointCount <= 1) {
+      return false;
+    }
     if (stroke.finalElementId != null &&
         (stroke.finalElementId != elementId ||
             stroke.finalPointCount != pointCount)) {
@@ -257,15 +282,27 @@ class _Handoff {
     return stroke.registration;
   }
 
+  _Stroke? abort({required int generation, required int sourceTimestampUs}) {
+    for (final stroke in _ordered.reversed) {
+      final identity = stroke.registration.identity;
+      if (identity.generation == generation &&
+          identity.sourceTimestampUs == sourceTimestampUs) {
+        _remove(stroke);
+        return stroke;
+      }
+    }
+    return null;
+  }
+
   List<_Registration> drainRetired() {
-    final result = List<_Registration>.of(_retired);
+    final result = [for (final stroke in _retired) stroke.registration];
     _retired.clear();
     return result;
   }
 
   List<_Registration> clear() {
     final result = <_Registration>[
-      ..._retired,
+      ..._retired.map((stroke) => stroke.registration),
       ..._ordered.map((stroke) => stroke.registration),
     ];
     _activeByPointer.clear();
@@ -284,7 +321,7 @@ class _Handoff {
 
   void _retire(_Stroke stroke) {
     _remove(stroke);
-    _retired.add(stroke.registration);
+    _retired.add(stroke);
   }
 
   void _remove(_Stroke stroke) {
@@ -342,6 +379,18 @@ class NativeInkBridge {
     _handoff.clear();
   }
 
+  void _releaseHandoff({bool notifyLastHandler = false}) {
+    final owners = _handoff.owners();
+    final lastHandler = _lastRequest?.handler;
+    if (notifyLastHandler && owners.isEmpty && lastHandler is PenHandler) {
+      owners.add(lastHandler);
+    }
+    _clearHandoff();
+    for (final owner in owners) {
+      owner.handleNativeInkArmLost();
+    }
+  }
+
   Future<Object?> _handleMethodCall(MethodCall call) async {
     if (call.method == 'nativeFailure') {
       final generation = call.arguments;
@@ -352,9 +401,25 @@ class NativeInkBridge {
         _enabled = false;
         _activationInFlight = false;
         _pendingFrameCallback = null;
+        _releaseHandoff(notifyLastHandler: true);
         _state = null;
-        _clearHandoff();
-        _notifyArmLost();
+      }
+      return null;
+    }
+    if (call.method == 'strokeAborted') {
+      final arguments = call.arguments;
+      if (arguments is Map) {
+        final generation = arguments['generation'];
+        final sourceTimestampUs = arguments['sourceTimestampUs'];
+        if (generation is int && sourceTimestampUs is int) {
+          final stroke = _handoff.abort(
+            generation: generation,
+            sourceTimestampUs: sourceTimestampUs,
+          );
+          stroke?.owner?.handleNativeInkStrokeAborted(
+            stroke.registration.identity,
+          );
+        }
       }
       return null;
     }
@@ -477,8 +542,8 @@ class NativeInkBridge {
       devicePixelRatio: devicePixelRatio,
     );
     _enabled = false;
+    _releaseHandoff();
     _state = state;
-    _clearHandoff();
     _activationTicket = ticket;
     _activationInFlight = true;
     try {
@@ -491,7 +556,7 @@ class NativeInkBridge {
       if (configured != true) {
         _enabled = false;
         _state = null;
-        _clearHandoff();
+        _releaseHandoff();
         return null;
       }
       final activated = await _invoke<Object>('enable', {
@@ -532,6 +597,7 @@ class NativeInkBridge {
     _controlEpoch++;
     _enabled = false;
     _pendingFrameCallback = null;
+    _releaseHandoff(notifyLastHandler: true);
     if (notifyNative && generation != null) {
       unawaited(_invoke<void>('disable', {'generation': generation}));
     }
@@ -541,30 +607,19 @@ class NativeInkBridge {
     final generation = _state?.generation;
     _retireForegrounds |= _handoff.hasFinals;
     disarm(notifyNative: false);
-    _clearHandoff();
     _state = null;
-    // Any pointer native was still drawing when this state was torn down
-    // (armChanged -> FLUTTER_ONLY, an ineligible reconfiguration, or
-    // dispose) needs Flutter to resume its own foreground preview so the
-    // stroke doesn't stall or vanish mid-draw.
-    _notifyArmLost();
     if (!_available || generation == null) return;
     await _invoke<void>('disable', {'generation': generation});
   }
 
-  // Tells the PenHandler this bridge was last configured for (if any) that
-  // native ink ownership is gone for every pointer it was drawing. A no-op
-  // when there is no such pointer (e.g. disable() ran between strokes).
-  void _notifyArmLost() {
-    final handler = _lastRequest?.handler;
-    if (handler is PenHandler) handler.handleNativeInkArmLost();
-  }
-
-  NativeInkStrokeIdentity? registerStroke(PointerDownEvent event) {
+  Future<NativeInkStrokeIdentity?> registerStroke(
+    PointerDownEvent event,
+  ) async {
     // Re-arm per stroke: a transient failure only blocks the stroke that
     // was active when it happened, unless failures keep recurring with no
     // successful stroke in between.
-    if (_failedState != null && _consecutiveFailures < _maxConsecutiveFailures) {
+    if (_failedState != null &&
+        _consecutiveFailures < _maxConsecutiveFailures) {
       _failedState = null;
     }
     final state = _state;
@@ -573,8 +628,10 @@ class NativeInkBridge {
       generation: state.generation,
       pointer: event.pointer,
       sourceTimestampUs: event.timeStamp.inMicroseconds,
+      owner: _lastRequest?.handler is PenHandler
+          ? _lastRequest!.handler as PenHandler
+          : null,
     );
-    _flushRetired();
     // Keep at most one pending (unacknowledged) final behind the newest
     // stroke; anything older is gap-safe to cancel now.
     final staleFinals = _handoff.cancelStaleFinals();
@@ -588,8 +645,29 @@ class NativeInkBridge {
       unawaited(disable());
       return null;
     }
-    unawaited(_invoke<void>('registerStroke', registration.toMap()));
-    return registration.identity;
+    _flushRetired();
+    final epoch = _controlEpoch;
+    final accepted = await _invoke<bool>(
+      'registerStroke',
+      registration.toMap(),
+    );
+    final identity = registration.identity;
+    if (accepted != true) {
+      _handoff.cancel(identity);
+      return null;
+    }
+    final current =
+        _available &&
+        _enabled &&
+        epoch == _controlEpoch &&
+        _state?.generation == identity.generation &&
+        _handoff.contains(identity);
+    if (!current || !_handoff.markAccepted(identity)) {
+      unawaited(_invoke<void>('cancelStroke', registration.toMap()));
+      _handoff.cancel(identity);
+      return null;
+    }
+    return identity;
   }
 
   bool markFinalStroke(
@@ -651,10 +729,10 @@ class NativeInkBridge {
   }
 
   void _fail() {
+    _releaseHandoff(notifyLastHandler: true);
     _available = false;
     _enabled = false;
     _controlEpoch++;
-    _clearHandoff();
   }
 
   static bool _validRect(Rect rect) =>

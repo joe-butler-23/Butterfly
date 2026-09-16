@@ -1,5 +1,10 @@
 part of 'handler.dart';
 
+class _NativeInkAttempt {
+  bool ended = false;
+  NativeInkStrokeIdentity? identity;
+}
+
 // This class represents the handler for the PenTool.
 class PenHandler extends Handler<PenTool> with ColoredHandler {
   bool _hideCursorWhileDrawing = false;
@@ -13,6 +18,9 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   final Map<int, VoidCallback>? _nativeInkCancellers = nativeInkLabEnabled
       ? {}
       : null;
+  final Map<int, _NativeInkAttempt> _nativeInkAttempts = {};
+  final Map<int, NativeInkStrokeIdentity> _nativeInkIdentities = {};
+  final Map<NativeInkStrokeIdentity, String> _nativeInkFinalizedIdentities = {};
   // Map to store the last positions of each element.
   final Map<int, Offset> lastPosition = {};
   // List for shapeDetection
@@ -34,9 +42,12 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   }
 
   void _cancelNativeInk(int pointer) {
+    final attempt = _nativeInkAttempts.remove(pointer);
+    attempt?.ended = true;
     final wasNativeOwned = _nativeInkCancellers?.containsKey(pointer) ?? false;
     _nativeInkCancellers?.remove(pointer)?.call();
     _nativeInkFinalizers?.remove(pointer);
+    _nativeInkIdentities.remove(pointer);
     // The pointer's accumulated points may not have been painted by Flutter
     // while native owned the stroke (see addPoint); now that ownership is
     // gone, catch the foreground preview up in one refresh so ink doesn't
@@ -55,9 +66,34 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   // its per-move refresh, and _cancelNativeInk triggers one refresh now so
   // the points already accumulated while native was drawing become visible.
   void handleNativeInkArmLost() {
-    for (final pointer
-        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+    for (final pointer in _nativeInkAttempts.keys.toList()) {
       _cancelNativeInk(pointer);
+    }
+    final hadNativeOwnedElements =
+        _nativeOwnedElementIds.isNotEmpty ||
+        _nativeInkFinalizedIdentities.isNotEmpty;
+    _nativeOwnedElementIds.clear();
+    _nativeInkFinalizedIdentities.clear();
+    if (hadNativeOwnedElements && _submittedElements.isNotEmpty) {
+      unawaited(_bloc?.delayedRefreshForegroundsOnly());
+    }
+  }
+
+  // Native reports an abandoned stroke by generation and source timestamp.
+  // Only the matching active or finalised stroke may return to Flutter; other
+  // pointers must keep their existing ownership.
+  void handleNativeInkStrokeAborted(NativeInkStrokeIdentity identity) {
+    for (final entry in _nativeInkAttempts.entries) {
+      if (entry.value.identity == identity) {
+        _cancelNativeInk(entry.key);
+        return;
+      }
+    }
+    final elementId = _nativeInkFinalizedIdentities.remove(identity);
+    if (elementId == null) return;
+    _nativeOwnedElementIds.remove(elementId);
+    if (_submittedElements.isNotEmpty) {
+      unawaited(_bloc?.delayedRefreshForegroundsOnly());
     }
   }
 
@@ -77,8 +113,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
   // Reset the input for the handler.
   @override
   void resetInput(DocumentBloc bloc) {
-    for (final pointer
-        in _nativeInkCancellers?.keys.toList() ?? const <int>[]) {
+    for (final pointer in _nativeInkAttempts.keys.toList()) {
       _cancelNativeInk(pointer);
     }
     submitElements(bloc, elements.keys.toList());
@@ -128,6 +163,8 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     _bloc = bloc;
     final submitted = <(int, PenElement)>[];
     for (final pointer in indexes) {
+      final attempt = _nativeInkAttempts.remove(pointer);
+      attempt?.ended = true;
       final element = elements.remove(pointer);
       final points = _elementPoints.remove(pointer);
       if (element == null) continue;
@@ -144,6 +181,7 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
     for (final (pointer, element) in submitted) {
       final cancel = _nativeInkCancellers?.remove(pointer);
       final finalize = _nativeInkFinalizers?.remove(pointer);
+      final identity = _nativeInkIdentities.remove(pointer);
       final id = element.id;
       final nativeOwned =
           finalize != null &&
@@ -152,6 +190,9 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
           finalize(id, element.points.length);
       if (nativeOwned) {
         _nativeOwnedElementIds.add(id);
+        if (identity != null) {
+          _nativeInkFinalizedIdentities[identity] = id;
+        }
       } else {
         cancel?.call();
       }
@@ -204,7 +245,10 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
       final id = element.id;
       final removed =
           id != null && (painted[id]?.contains(element.points.length) ?? false);
-      if (removed) _nativeOwnedElementIds.remove(id);
+      if (removed) {
+        _nativeOwnedElementIds.remove(id);
+        _nativeInkFinalizedIdentities.removeWhere((_, value) => value == id);
+      }
       return removed;
     });
     final changed = previousLength != _submittedElements.length;
@@ -335,6 +379,9 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
       context.refreshForegrounds();
       return;
     }
+    // A pointer id can be reused while an earlier registration reply is still
+    // in flight. Invalidate the old attempt before creating the new element.
+    _cancelNativeInk(event.pointer);
     elements.remove(event.pointer);
     _elementPoints.remove(event.pointer);
     addPoint(
@@ -355,16 +402,28 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
         !context.isAltPressed &&
         !context.isCtrlPressed &&
         register != null &&
-        finalize != null) {
-      final identity = register(event);
-      if (identity != null) {
-        _nativeInkFinalizers?[event.pointer] = (elementId, pointCount) =>
-            finalize(identity, elementId, pointCount);
-        final cancel = context.cancelNativeInkStroke;
-        if (cancel != null) {
+        finalize != null &&
+        context.cancelNativeInkStroke != null) {
+      final attempt = _NativeInkAttempt();
+      _nativeInkAttempts[event.pointer] = attempt;
+      final cancel = context.cancelNativeInkStroke!;
+      unawaited(
+        Future.sync(() => register(event)).then((identity) {
+          if (identity == null) return;
+          final current =
+              identical(_nativeInkAttempts[event.pointer], attempt) &&
+              !attempt.ended;
+          if (!current) {
+            cancel(identity);
+            return;
+          }
+          attempt.identity = identity;
+          _nativeInkIdentities[event.pointer] = identity;
+          _nativeInkFinalizers?[event.pointer] = (elementId, pointCount) =>
+              finalize(identity, elementId, pointCount);
           _nativeInkCancellers?[event.pointer] = () => cancel(identity);
-        }
-      }
+        }),
+      );
     }
   }
 

@@ -19,6 +19,7 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import io.flutter.embedding.engine.FlutterEngine;
@@ -74,8 +75,8 @@ public final class LatencyLabActivity extends MainActivity {
                             result.success(null);
                         }
                         case "registerStroke" -> {
-                            if (wetInk != null) wetInk.registerStroke(call.arguments);
-                            result.success(null);
+                            StylusWetInkRenderer renderer = wetInk;
+                            result.success(renderer != null && renderer.registerStroke(call.arguments));
                         }
                         case "acknowledgeStroke" -> {
                             StylusWetInkRenderer renderer = wetInk;
@@ -107,6 +108,8 @@ public final class LatencyLabActivity extends MainActivity {
             if (renderer == null) return false;
             renderer.setFailureCallback(
                     generation -> onRendererFailure(renderer, generation));
+            renderer.setStrokeAbortedCallback((generation, sourceTimestampUs) ->
+                    onStrokeAborted(renderer, generation, sourceTimestampUs));
             if (!renderer.configure(arguments)) {
                 Log.w(TAG, "configureWetInk: renderer.configure() returned false, mode=" + mode);
                 destroyWetInk();
@@ -287,6 +290,20 @@ public final class LatencyLabActivity extends MainActivity {
             MethodChannel currentChannel = channel;
             if (currentChannel != null) {
                 currentChannel.invokeMethod("nativeFailure", failureGeneration);
+            }
+        });
+    }
+
+    private void onStrokeAborted(StylusWetInkRenderer renderer, long strokeGeneration,
+            long sourceTimestampUs) {
+        runOnUiThread(() -> {
+            if (renderer != wetInk || strokeGeneration != configuredGeneration) return;
+            MethodChannel currentChannel = channel;
+            if (currentChannel != null) {
+                Map<String, Object> identity = new HashMap<>();
+                identity.put("generation", strokeGeneration);
+                identity.put("sourceTimestampUs", sourceTimestampUs);
+                currentChannel.invokeMethod("strokeAborted", identity);
             }
         });
     }

@@ -1,7 +1,6 @@
 package dev.linwood.butterfly;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -27,7 +26,7 @@ import java.util.Set;
  *
  * <p>It also proves that {@link PerfectFreehandGeometry.IncrementalOutline} -- the append-only
  * engine {@code SharedGeometryInkOverlay} drives frame by frame -- produces exactly the same
- * outline as a from-scratch computation, so drawing only its per-frame tail is safe.
+ * outline as a from-scratch computation. Raster replacement remains the renderer's contract.
  */
 public class PerfectFreehandGeometryParityTest {
     private static final double TOLERANCE = 1e-3;
@@ -89,7 +88,7 @@ public class PerfectFreehandGeometryParityTest {
 
         // Drive the engine exactly the way SharedGeometryInkOverlay does: an initial batch (the
         // points already appended by the time the first frame renders), then one point per call
-        // afterward -- and record the union of every drawn tail along the way.
+        // afterward -- and record the union of their geometry along the way.
         PerfectFreehandGeometry.IncrementalOutline engine = new PerfectFreehandGeometry.IncrementalOutline(
                 fixture.size, fixture.thinning, fixture.smoothing, fixture.streamline);
         Set<String> tailUnion = new LinkedHashSet<>();
@@ -103,93 +102,86 @@ public class PerfectFreehandGeometryParityTest {
         assertPointListsEqual("left rail", reference.left, engine.leftPointsSnapshot());
         assertPointListsEqual("right rail", reference.right, engine.rightPointsSnapshot());
 
-        // 2) Every point of the full outline was actually drawn by the union of tails.
+        // 2) Every point of the full outline occurs in the union of tails. This is geometry
+        // coverage only; it deliberately makes no claim about raster replacement or pixels.
         for (PerfectFreehandGeometry.Point expected : reference.assemble()) {
             String key = key(expected);
-            assertTrue("outline point " + key + " was never drawn by any incremental tail",
+            assertTrue("outline point " + key + " was absent from every incremental tail",
                     tailUnion.contains(key));
         }
     }
 
     @Test
-    public void checkpointTailUnionMatchesFullOutlineForLongFixture() throws IOException {
-        Fixture fixture = findFixture(readFixtures(), "long_400pt");
-        List<PerfectFreehandGeometry.Point> points = fixture.points;
-        assertTrue("fixture too short to exercise multiple checkpoints", points.size() > 50);
-
-        PerfectFreehandGeometry.Options options = fixture.options();
-        PerfectFreehandGeometry.OutlineParts reference = PerfectFreehandGeometry.getStrokeOutlineParts(
-                PerfectFreehandGeometry.getStrokePoints(points, options), options);
-
-        // Drive the engine the way SharedGeometryInkOverlay does on the front-buffer path
-        // (appendPoints for every new point) and, on an interval that deliberately does not
-        // evenly divide the fixture or align with INITIAL_BATCH, also pull a checkpointTail() the
-        // way drawCheckpointDelta does for the multi-buffered layer -- proving checkpointTail()'s
-        // incremental result is correct regardless of exactly which points count as a
-        // "checkpoint", not just the app's own fixed 16-point cadence.
-        final int checkpointInterval = 13;
-        PerfectFreehandGeometry.IncrementalOutline engine = new PerfectFreehandGeometry.IncrementalOutline(
-                fixture.size, fixture.thinning, fixture.smoothing, fixture.streamline);
-        Set<String> checkpointUnion = new LinkedHashSet<>();
-        engine.appendPoints(points.subList(0, INITIAL_BATCH));
-        for (int i = INITIAL_BATCH; i < points.size(); i++) {
-            engine.appendPoints(List.of(points.get(i)));
-            if ((i + 1) % checkpointInterval == 0) {
-                addTail(checkpointUnion, engine.checkpointTail());
-            }
+    public void predictedTailDoesNotMutateCommittedRails() {
+        PerfectFreehandGeometry.IncrementalOutline engine =
+                new PerfectFreehandGeometry.IncrementalOutline(5, .5, .5, .3);
+        List<PerfectFreehandGeometry.Point> points = new ArrayList<>();
+        for (int i = 0; i < 24; i++) {
+            points.add(new PerfectFreehandGeometry.Point(i * 5, 0, .5));
         }
-        // Stroke completion also checkpoints (a final, possibly-partial interval): mirror that so
-        // the union covers the whole stroke, not just whole checkpointInterval-point prefixes.
-        addTail(checkpointUnion, engine.checkpointTail());
+        engine.appendPoints(points);
+        List<PerfectFreehandGeometry.Point> leftBefore = engine.leftPointsSnapshot();
+        List<PerfectFreehandGeometry.Point> rightBefore = engine.rightPointsSnapshot();
 
-        for (PerfectFreehandGeometry.Point expected : reference.assemble()) {
-            String key = key(expected);
-            assertTrue("outline point " + key + " was never drawn by any checkpoint delta",
-                    checkpointUnion.contains(key));
+        engine.predictTail(new PerfectFreehandGeometry.Point(120, 10, .5));
+
+        assertPointListsEqual("predicted left rollback", leftBefore, engine.leftPointsSnapshot());
+        assertPointListsEqual("predicted right rollback", rightBefore, engine.rightPointsSnapshot());
+    }
+
+    @Test
+    public void onePointProducesDrawableWetInkGeometry() {
+        PerfectFreehandGeometry.IncrementalOutline engine =
+                new PerfectFreehandGeometry.IncrementalOutline(5, .5, .5, .3);
+        PerfectFreehandGeometry.IncrementalOutline.TailResult tail =
+                engine.appendPoints(List.of(new PerfectFreehandGeometry.Point(10, 20, .5)));
+        assertTrue("one real sample should produce a drawable outline", tail.polygon.size() > 1);
+    }
+
+    @Test
+    public void pressurePolicyChangeRebuildsToFluttersActualPressureGeometry() {
+        PerfectFreehandGeometry.IncrementalOutline engine =
+                new PerfectFreehandGeometry.IncrementalOutline(5, .5, .5, .3);
+        List<PerfectFreehandGeometry.Point> points = new ArrayList<>();
+        for (int i = 0; i < 24; i++) {
+            points.add(new PerfectFreehandGeometry.Point(i * 5, 0, .5));
         }
+        points.add(new PerfectFreehandGeometry.Point(120, 0, .8));
+        points.add(new PerfectFreehandGeometry.Point(125, 0, .7));
+        engine.appendPoints(points.subList(0, 24));
+        engine.appendPoints(points.subList(24, points.size()));
+
+        PerfectFreehandGeometry.Options actualPressure =
+                PerfectFreehandGeometry.butterflyOptions(5, .5, .5, .3, false);
+        PerfectFreehandGeometry.OutlineParts reference = PerfectFreehandGeometry
+                .getStrokeOutlineParts(PerfectFreehandGeometry.getStrokePoints(points, actualPressure),
+                        actualPressure);
+        assertPointListsEqual("actual-pressure left rail", reference.left, engine.leftPointsSnapshot());
+        assertPointListsEqual("actual-pressure right rail", reference.right, engine.rightPointsSnapshot());
     }
 
     @Test
-    public void boundsOfComputesTheTightBoundingBoxOfGivenPoints() {
-        List<PerfectFreehandGeometry.Point> points = List.of(
-                new PerfectFreehandGeometry.Point(3.0, -2.0, null),
-                new PerfectFreehandGeometry.Point(-1.5, 7.0, null),
-                new PerfectFreehandGeometry.Point(10.0, 0.0, null));
-        PerfectFreehandGeometry.Bounds bounds = PerfectFreehandGeometry.boundsOf(points);
-        assertEquals(-1.5, bounds.left, 0.0);
-        assertEquals(-2.0, bounds.top, 0.0);
-        assertEquals(10.0, bounds.right, 0.0);
-        assertEquals(7.0, bounds.bottom, 0.0);
-    }
+    public void firstPressureUsesTheSecondDistinctSampleAcrossFrontBufferDrains() {
+        PerfectFreehandGeometry.IncrementalOutline engine =
+                new PerfectFreehandGeometry.IncrementalOutline(5, .5, .5, .3, true);
+        List<PerfectFreehandGeometry.Point> points = new ArrayList<>();
+        points.add(new PerfectFreehandGeometry.Point(0, 0, .2));
+        for (int i = 1; i < 24; i++) {
+            points.add(new PerfectFreehandGeometry.Point(i * 5, 0, .7));
+        }
+        for (PerfectFreehandGeometry.Point point : points) {
+            engine.appendPoints(List.of(point));
+        }
 
-    @Test
-    public void boundsOfReturnsNullForAnEmptyList() {
-        assertNull(PerfectFreehandGeometry.boundsOf(List.of()));
-    }
-
-    @Test
-    public void boundsUnionCoversBothInputs() {
-        PerfectFreehandGeometry.Bounds a = PerfectFreehandGeometry.boundsOf(List.of(
-                new PerfectFreehandGeometry.Point(0.0, 0.0, null),
-                new PerfectFreehandGeometry.Point(2.0, 2.0, null)));
-        PerfectFreehandGeometry.Bounds b = PerfectFreehandGeometry.boundsOf(List.of(
-                new PerfectFreehandGeometry.Point(5.0, -3.0, null),
-                new PerfectFreehandGeometry.Point(6.0, 1.0, null)));
-        PerfectFreehandGeometry.Bounds union = a.union(b);
-        assertEquals(0.0, union.left, 0.0);
-        assertEquals(-3.0, union.top, 0.0);
-        assertEquals(6.0, union.right, 0.0);
-        assertEquals(2.0, union.bottom, 0.0);
-    }
-
-    @Test
-    public void boundsPaddedGrowsEverySideByTheSameAmount() {
-        PerfectFreehandGeometry.Bounds bounds = new PerfectFreehandGeometry.Bounds(1.0, 2.0, 3.0, 4.0);
-        PerfectFreehandGeometry.Bounds padded = bounds.padded(1.5);
-        assertEquals(-0.5, padded.left, 1e-9);
-        assertEquals(0.5, padded.top, 1e-9);
-        assertEquals(4.5, padded.right, 1e-9);
-        assertEquals(5.5, padded.bottom, 1e-9);
+        List<PerfectFreehandGeometry.Point> flutterPoints = new ArrayList<>(points);
+        flutterPoints.set(0, new PerfectFreehandGeometry.Point(0, 0, .7));
+        PerfectFreehandGeometry.Options options =
+                PerfectFreehandGeometry.butterflyOptions(5, .5, .5, .3, true);
+        PerfectFreehandGeometry.OutlineParts reference = PerfectFreehandGeometry
+                .getStrokeOutlineParts(
+                        PerfectFreehandGeometry.getStrokePoints(flutterPoints, options), options);
+        assertPointListsEqual("first-pressure left rail", reference.left, engine.leftPointsSnapshot());
+        assertPointListsEqual("first-pressure right rail", reference.right, engine.rightPointsSnapshot());
     }
 
     private static void addTail(Set<String> union, List<PerfectFreehandGeometry.Point> tail) {

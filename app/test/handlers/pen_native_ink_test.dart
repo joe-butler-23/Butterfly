@@ -1,3 +1,5 @@
+import 'dart:async';
+
 // Tests for the native-ink move-refresh optimisation in PenHandler.addPoint
 // (app/lib/handlers/pen.dart): while a stroke is native-owned, Flutter's own
 // foreground preview must not be repainted on every pointer move (that work
@@ -62,6 +64,7 @@ void main() {
       when(() => bloc.delayedRefreshForegroundsOnly()).thenAnswer((_) async {
         refreshCount++;
       });
+      when(() => bloc.refreshForegrounds()).thenAnswer((_) async {});
       when(() => bloc.refreshForegroundsOnly()).thenAnswer((_) async {});
       when(() => bloc.add(any())).thenReturn(null);
       when(() => bloc.stream).thenAnswer((_) => const Stream.empty());
@@ -112,8 +115,13 @@ void main() {
     );
 
     EventContext eventContext({
-      NativeInkStrokeIdentity? Function(PointerDownEvent event)? register,
-      bool Function(NativeInkStrokeIdentity identity, String elementId, int pointCount)?
+      Future<NativeInkStrokeIdentity?> Function(PointerDownEvent event)?
+      register,
+      bool Function(
+        NativeInkStrokeIdentity identity,
+        String elementId,
+        int pointCount,
+      )?
       finalize,
       void Function(NativeInkStrokeIdentity identity)? cancel,
     }) => EventContext(
@@ -140,22 +148,110 @@ void main() {
       kind: PointerDeviceKind.stylus,
     );
 
+    PointerUpEvent up(int pointer, Offset position) => PointerUpEvent(
+      pointer: pointer,
+      position: position,
+      kind: PointerDeviceKind.stylus,
+    );
+
+    PointerCancelEvent cancel(int pointer) => PointerCancelEvent(
+      pointer: pointer,
+      position: Offset.zero,
+      kind: PointerDeviceKind.stylus,
+    );
+
+    testWidgets(
+      'a late accepted reply after up cannot reclaim a reused pointer id',
+      (tester) async {
+        await pump(tester);
+        final pointer = nextPointer++;
+        var registration = Completer<NativeInkStrokeIdentity?>();
+        final oldReply = registration;
+        final cancelled = <NativeInkStrokeIdentity>[];
+        final context = eventContext(
+          register: (_) => registration.future,
+          finalize: (_, _, _) => true,
+          cancel: cancelled.add,
+        );
+
+        handler.onPointerDown(down(pointer, const Offset(0, 0)), context);
+        handler.onPointerUp(up(pointer, const Offset(1, 1)), context);
+        const oldIdentity = (
+          generation: 1,
+          strokeSequence: 1,
+          sourceTimestampUs: 1,
+        );
+
+        registration = Completer<NativeInkStrokeIdentity?>();
+        handler.onPointerDown(down(pointer, const Offset(2, 2)), context);
+        const newIdentity = (
+          generation: 1,
+          strokeSequence: 2,
+          sourceTimestampUs: 2,
+        );
+        await tester.pump();
+        registration.complete(newIdentity);
+        await tester.pump();
+        await tester.pump();
+
+        // Deliver the old reply after the reused pointer is already owned.
+        // It must retire only the old identity, without cancelling the new one.
+        oldReply.complete(oldIdentity);
+        await tester.pump();
+        await tester.pump();
+
+        handler.onPointerMove(move(pointer, const Offset(5, 5)), context);
+        expect(cancelled, [oldIdentity]);
+        expect(refreshCount, 2);
+      },
+    );
+
+    testWidgets(
+      'a late accepted reply after cancel cannot reclaim the cancelled stroke',
+      (tester) async {
+        await pump(tester);
+        final pointer = nextPointer++;
+        final registration = Completer<NativeInkStrokeIdentity?>();
+        final cancelled = <NativeInkStrokeIdentity>[];
+        final context = eventContext(
+          register: (_) => registration.future,
+          finalize: (_, _, _) => true,
+          cancel: cancelled.add,
+        );
+
+        handler.onPointerDown(down(pointer, const Offset(0, 0)), context);
+        handler.onPointerCancel(cancel(pointer), context);
+        const identity = (
+          generation: 1,
+          strokeSequence: 3,
+          sourceTimestampUs: 3,
+        );
+        registration.complete(identity);
+        await tester.pump();
+
+        expect(cancelled, [identity]);
+        expect(handler.elements, isEmpty);
+      },
+    );
+
     testWidgets(
       'a native-owned stroke does not schedule a foreground refresh on move',
       (tester) async {
         await pump(tester);
         final pointer = nextPointer++;
         final context = eventContext(
-          register: (_) => (
+          register: (_) => Future.value((
             generation: 1,
             strokeSequence: 1,
             sourceTimestampUs: 0,
-          ),
+          )),
           finalize: (_, _, _) => true,
           cancel: (_) {},
         );
 
         handler.onPointerDown(down(pointer, const Offset(0, 0)), context);
+        await tester.pump();
+        await tester.pump();
         // The very first point of the stroke is painted before native
         // ownership is known, so it always refreshes once.
         expect(refreshCount, 1);
@@ -183,7 +279,7 @@ void main() {
       // or nativeInk is simply unavailable), so the stroke stays Flutter-
       // owned end to end.
       final context = eventContext(
-        register: (_) => null,
+        register: (_) => Future.value(null),
         finalize: (_, _, _) => true,
         cancel: (_) {},
       );
@@ -205,16 +301,18 @@ void main() {
         final pointer = nextPointer++;
         var cancelled = false;
         final context = eventContext(
-          register: (_) => (
+          register: (_) => Future.value((
             generation: 1,
             strokeSequence: 1,
             sourceTimestampUs: 0,
-          ),
+          )),
           finalize: (_, _, _) => true,
           cancel: (_) => cancelled = true,
         );
 
         handler.onPointerDown(down(pointer, const Offset(0, 0)), context);
+        await tester.pump();
+        await tester.pump();
         handler.onPointerMove(move(pointer, const Offset(5, 5)), context);
         expect(
           refreshCount,

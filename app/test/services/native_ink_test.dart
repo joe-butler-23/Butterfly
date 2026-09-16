@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:butterfly/cubits/settings.dart';
 import 'package:butterfly/cubits/transform.dart';
 import 'package:butterfly/handlers/handler.dart';
@@ -16,6 +18,25 @@ import 'package:flutter_test/flutter_test.dart';
 // channel.setMethodCallHandler in its constructor.
 const _testChannel = MethodChannel('test.linwood.dev/native_ink');
 
+class _RecordingPenHandler extends PenHandler {
+  _RecordingPenHandler() : super(PenTool(id: 'pen'));
+
+  int armLostCalls = 0;
+  final aborted = <NativeInkStrokeIdentity>[];
+
+  @override
+  void handleNativeInkArmLost() {
+    armLostCalls++;
+    super.handleNativeInkArmLost();
+  }
+
+  @override
+  void handleNativeInkStrokeAborted(NativeInkStrokeIdentity identity) {
+    aborted.add(identity);
+    super.handleNativeInkStrokeAborted(identity);
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -28,6 +49,7 @@ void main() {
       switch (call.method) {
         case 'configure':
         case 'enable':
+        case 'registerStroke':
           return true;
         default:
           return null;
@@ -56,9 +78,10 @@ void main() {
   Future<NativeInkState?> arm(
     NativeInkBridge bridge, {
     Rect canvasBounds = const Rect.fromLTWH(0, 0, 100, 100),
+    Handler? handler,
   }) {
     return bridge.updateState(
-      handler: PenHandler(PenTool(id: 'pen')),
+      handler: handler ?? PenHandler(PenTool(id: 'pen')),
       settings: const ButterflySettings(autosave: false),
       canvasBounds: canvasBounds,
       devicePixelRatio: 1,
@@ -91,7 +114,10 @@ void main() {
         channel: _testChannel,
         enabled: false,
       );
-      expect(disabledBridge.registerStroke(pointerDown(pointer: 1)), isNull);
+      expect(
+        await disabledBridge.registerStroke(pointerDown(pointer: 1)),
+        isNull,
+      );
       expect(calls, isEmpty);
 
       // Available, but never configured/armed.
@@ -100,7 +126,7 @@ void main() {
         enabled: true,
       );
       expect(
-        unconfiguredBridge.registerStroke(pointerDown(pointer: 1)),
+        await unconfiguredBridge.registerStroke(pointerDown(pointer: 1)),
         isNull,
       );
       expect(calls, isEmpty);
@@ -112,7 +138,7 @@ void main() {
       expect(bridge.enabled, isTrue);
       calls.clear();
 
-      final identity = bridge.registerStroke(
+      final identity = await bridge.registerStroke(
         pointerDown(pointer: 7, micros: 12345),
       );
       expect(identity, isNotNull);
@@ -129,12 +155,80 @@ void main() {
   );
 
   testWidgets(
+    'registerStroke stays pending until native explicitly accepts the DOWN',
+    (tester) async {
+      final reply = Completer<Object?>();
+      respond = (call) {
+        if (call.method == 'registerStroke') return reply.future;
+        if (call.method == 'configure' || call.method == 'enable') return true;
+        return null;
+      };
+      final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
+      await arm(bridge);
+
+      final pending = bridge.registerStroke(
+        pointerDown(pointer: 8, micros: 8000),
+      );
+      await tester.pump();
+      expect(
+        calls.where((call) => call.method == 'registerStroke'),
+        hasLength(1),
+      );
+      expect(bridge.awaitingPaintHandoff, isFalse);
+
+      reply.complete(true);
+      final identity = await pending;
+      expect(identity, isNotNull);
+      expect(bridge.markFinalStroke(identity!, 'accepted', 2), isTrue);
+    },
+  );
+
+  testWidgets('registerStroke refusal never creates native ownership', (
+    tester,
+  ) async {
+    respond = (call) {
+      if (call.method == 'registerStroke') return false;
+      if (call.method == 'configure' || call.method == 'enable') return true;
+      return null;
+    };
+    final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
+    await arm(bridge);
+
+    final identity = await bridge.registerStroke(
+      pointerDown(pointer: 9, micros: 9000),
+    );
+    expect(identity, isNull);
+    expect(calls.where((call) => call.method == 'cancelStroke'), isEmpty);
+    expect(bridge.awaitingPaintHandoff, isFalse);
+  });
+
+  testWidgets('strokeAborted releases only the matching accepted stroke', (
+    tester,
+  ) async {
+    final handler = _RecordingPenHandler();
+    final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
+    final state = await arm(bridge, handler: handler);
+    final identity = (await bridge.registerStroke(
+      pointerDown(pointer: 10, micros: 10000),
+    ))!;
+
+    await deliverIncoming('strokeAborted', {
+      'generation': state!.generation,
+      'sourceTimestampUs': identity.sourceTimestampUs,
+    });
+
+    expect(handler.aborted, [identity]);
+    expect(bridge.markFinalStroke(identity, 'aborted', 2), isFalse);
+    expect(handler.armLostCalls, 0);
+  });
+
+  testWidgets(
     'markFinalStroke returns true for a registered identity and false for '
     'an unknown one',
     (tester) async {
       final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
       await arm(bridge);
-      final identity = bridge.registerStroke(pointerDown(pointer: 1))!;
+      final identity = (await bridge.registerStroke(pointerDown(pointer: 1)))!;
       calls.clear();
 
       expect(bridge.markFinalStroke(identity, 'element-1', 3), isTrue);
@@ -152,7 +246,7 @@ void main() {
 
       // A registered stroke that cannot be finalised (a one-point dot) is
       // cancelled on both sides so native drops its wet stroke too.
-      final dot = bridge.registerStroke(pointerDown(pointer: 2))!;
+      final dot = (await bridge.registerStroke(pointerDown(pointer: 2)))!;
       calls.clear();
       expect(bridge.markFinalStroke(dot, 'element-3', 1), isFalse);
       expect(calls.where((c) => c.method == 'cancelStroke'), hasLength(1));
@@ -179,22 +273,16 @@ void main() {
       await arm(bridge);
       final identities = <int, NativeInkStrokeIdentity>{};
       for (final s in [...matched, ...mismatched]) {
-        identities[s.$1] = bridge.registerStroke(
+        identities[s.$1] = (await bridge.registerStroke(
           pointerDown(pointer: s.$1),
-        )!;
+        ))!;
       }
       for (final s in matched) {
-        expect(
-          bridge.markFinalStroke(identities[s.$1]!, s.$2, s.$3),
-          isTrue,
-        );
+        expect(bridge.markFinalStroke(identities[s.$1]!, s.$2, s.$3), isTrue);
       }
       // "wrong-count" stroke reports element id "wrong-count" with a
       // different point count (4) than the receipt below (5) will claim.
-      expect(
-        bridge.markFinalStroke(identities[3]!, 'wrong-count', 4),
-        isTrue,
-      );
+      expect(bridge.markFinalStroke(identities[3]!, 'wrong-count', 4), isTrue);
       // "not-painted" is left pending (never marked final).
 
       calls.clear();
@@ -225,9 +313,9 @@ void main() {
       for (var cycle = 0; cycle < 3; cycle++) {
         final cycleState = await arm(bridge);
         expect(cycleState, isNotNull, reason: 'cycle $cycle should arm');
-        final id = bridge.registerStroke(
+        final id = (await bridge.registerStroke(
           pointerDown(pointer: 100 + cycle),
-        )!;
+        ))!;
         expect(bridge.markFinalStroke(id, 'cycle-$cycle', 2), isTrue);
         bridge.acknowledgePaintedElements([
           (elementId: 'cycle-$cycle', pointCount: 2),
@@ -238,7 +326,7 @@ void main() {
         // the failed configuration (native_ink.dart:553), letting the next
         // updateState attempt for the same config run fresh rather than
         // being short-circuited by `_failedState`.
-        bridge.registerStroke(pointerDown(pointer: 200 + cycle));
+        await bridge.registerStroke(pointerDown(pointer: 200 + cycle));
       }
 
       calls.clear();
@@ -264,24 +352,21 @@ void main() {
 
       for (var pointer = 1; pointer <= 16; pointer++) {
         calls.clear();
-        final identity = bridge.registerStroke(pointerDown(pointer: pointer));
-        expect(identity, isNotNull, reason: 'pointer $pointer should arm');
-        expect(
-          calls.where((c) => c.method == 'registerStroke'),
-          hasLength(1),
+        final identity = await bridge.registerStroke(
+          pointerDown(pointer: pointer),
         );
+        expect(identity, isNotNull, reason: 'pointer $pointer should arm');
+        expect(calls.where((c) => c.method == 'registerStroke'), hasLength(1));
       }
 
       // The 17th pending stroke pushes the handoff past its bound.
       calls.clear();
-      final overflowIdentity = bridge.registerStroke(
+      final overflowIdentity = await bridge.registerStroke(
         pointerDown(pointer: 17),
       );
       expect(overflowIdentity, isNull);
       expect(calls.where((c) => c.method == 'registerStroke'), isEmpty);
-      final disableCalls = calls
-          .where((c) => c.method == 'disable')
-          .toList();
+      final disableCalls = calls.where((c) => c.method == 'disable').toList();
       expect(disableCalls, hasLength(1));
 
       // disable() clears the arm; the bridge no longer treats itself as
@@ -298,12 +383,12 @@ void main() {
       final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
       await arm(bridge);
 
-      final identityA = bridge.registerStroke(pointerDown(pointer: 1))!;
-      final identityB = bridge.registerStroke(pointerDown(pointer: 2))!;
+      final identityA = (await bridge.registerStroke(pointerDown(pointer: 1)))!;
+      final identityB = (await bridge.registerStroke(pointerDown(pointer: 2)))!;
       expect(bridge.markFinalStroke(identityA, 'element-a', 3), isTrue);
 
       calls.clear();
-      final identityC = bridge.registerStroke(pointerDown(pointer: 3));
+      final identityC = await bridge.registerStroke(pointerDown(pointer: 3));
       expect(identityC, isNotNull);
 
       // A (older than the newest two: B and C) had a pending final and must
@@ -313,10 +398,7 @@ void main() {
           .toList();
       expect(cancelCalls, hasLength(1));
       final cancelledArgs = cancelCalls.single.arguments as Map;
-      expect(
-        cancelledArgs['strokeSequence'],
-        identityA.strokeSequence,
-      );
+      expect(cancelledArgs['strokeSequence'], identityA.strokeSequence);
 
       // B (one of the newest two) is untouched even though it has no final
       // yet, and remains registered.
@@ -376,10 +458,7 @@ void main() {
         hasLength(1),
         reason: 'the coalesced post-frame reconfiguration runs only once',
       );
-      expect(
-        calls.where((c) => c.method == 'enable'),
-        hasLength(1),
-      );
+      expect(calls.where((c) => c.method == 'enable'), hasLength(1));
     },
   );
 
@@ -389,16 +468,14 @@ void main() {
     (tester) async {
       final bridge = NativeInkBridge(channel: _testChannel, enabled: true);
       final state = await arm(bridge);
-      final identity = bridge.registerStroke(pointerDown(pointer: 1))!;
+      final identity = (await bridge.registerStroke(pointerDown(pointer: 1)))!;
       expect(bridge.markFinalStroke(identity, 'element-1', 2), isTrue);
       expect(bridge.awaitingPaintHandoff, isTrue);
 
       calls.clear();
       await bridge.disable();
 
-      final disableCalls = calls
-          .where((c) => c.method == 'disable')
-          .toList();
+      final disableCalls = calls.where((c) => c.method == 'disable').toList();
       expect(disableCalls, hasLength(1));
       expect(
         (disableCalls.single.arguments as Map)['generation'],

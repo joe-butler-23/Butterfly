@@ -37,10 +37,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private static final String TAG = "ButterflyInk";
     private static final int CHECKPOINT_POINTS = 16;
-    // Extra padding, beyond the policy stroke width, on the local rect drawCheckpointDelta clips
-    // and clears at each checkpoint: covers antialiasing bleed at the fragment's edge so no
-    // fractional-alpha fringe from the previous checkpoint's draw survives just outside it.
-    private static final float CHECKPOINT_CLEAR_MARGIN_PX = 4f;
     private static final Executor DIRECT = Runnable::run;
     // The predicted tail is drawn at this fraction of the stroke colour's full alpha so an
     // over-running prediction reads visually as a hint, not committed ink.
@@ -178,15 +174,18 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     @Nullable private Snapshot latestSnapshot;
     @Nullable private ActivationCallback activationCallback;
     @Nullable private FailureCallback failureCallback;
+    @Nullable private StrokeAbortedCallback strokeAbortedCallback;
     @Nullable private MotionEventPredictor predictor;
     @Nullable private PlatformPredictor platformPredictor;
     @Nullable private PerfectFreehandGeometry.Point pendingPredicted;
+    @Nullable private PerfectFreehandGeometry.Point lastInputPoint;
     private boolean drainPosted, frontRenderOutstanding;
     private boolean configured, enabled, attached, surfaceReady, rendererControlReady, ready;
     private boolean surfaceCallbackRegistered, failed, clearRequested;
     private long generation = Long.MIN_VALUE;
     private long readinessEpoch, preflightEpoch = Long.MIN_VALUE, prewarmedGeneration = Long.MIN_VALUE;
     private long nextToken, activeToken = Long.MIN_VALUE;
+    private long activeSourceTimestampUs = Long.MIN_VALUE;
     private int activePointer = -1;
     // How many of `points` the renderer thread has already seen; only the points beyond this
     // cursor are copied across on the next drain (see drainLatest()).
@@ -251,6 +250,10 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     @Override public void setFailureCallback(FailureCallback callback) {
         failureCallback = callback;
+    }
+
+    @Override public void setStrokeAbortedCallback(StrokeAbortedCallback callback) {
+        strokeAbortedCallback = callback;
     }
 
     @Override public boolean configure(Object arguments) {
@@ -388,14 +391,18 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             // individually, the same way Flutter's PenHandler.addPoint does, instead of ending
             // the stroke; only a pointer identity mismatch (unsupported multi-touch) aborts here.
             case MotionEvent.ACTION_MOVE -> {
-                if (pointer != activePointer) {
+                if (activePointer == -1) {
+                    return;
+                } else if (pointer != activePointer) {
                     abortStroke("MOVE pointer id " + pointer + " != active " + activePointer);
                 } else if (!appendEvent(event, index, false, locationX, locationY)) {
                     abortStroke("appendEvent rejected a MOVE sample (non-finite coordinate)");
                 }
             }
             case MotionEvent.ACTION_UP -> {
-                if (pointer != activePointer) {
+                if (activePointer == -1) {
+                    return;
+                } else if (pointer != activePointer) {
                     abortStroke("UP pointer id " + pointer + " != active " + activePointer);
                 } else if (appendEvent(event, index, true, locationX, locationY)) {
                     activePointer = -1;
@@ -501,9 +508,11 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
         activePointer = pointer;
         activeToken = ++nextToken;
+        activeSourceTimestampUs = event.getEventTime() * 1_000L;
         points.clear();
         drainedCount = 0;
         totalPointCount = 0;
+        lastInputPoint = null;
         pendingPredicted = null;
         // Info level: the tablet drops debug lines globally (log.tag=I).
         Log.i(TAG, "stroke token=" + activeToken + " prediction horizon="
@@ -512,7 +521,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                                 : "androidx MotionEventPredictor")));
         // retainedCount() == 0 was just checked above, so this insert can never overflow
         // the bounded map; there is no per-token buffer here to clear if it somehow did.
-        handoff.addNativeStroke(generation, event.getEventTime() * 1_000L, activeToken);
+        handoff.addNativeStroke(generation, activeSourceTimestampUs, activeToken);
         flutterInputView.requestUnbufferedDispatch(event);
         if (!appendEvent(event, 0, false, locationX, locationY)) {
             abortStroke("initial DOWN sample rejected by appendEvent");
@@ -546,15 +555,13 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                 locationX, locationY)) {
             return false;
         }
-        // A degenerate stroke (0 or 1 point, e.g. every sample landed outside the canvas, or
-        // down/up coincided) was never submitted for rendering below, so there is no wet ink to
-        // hand off; aborting here is cleanup of the handoff entry, not a bounds decision. This is
-        // the stroke-wide total, not points.size(): drainLatest() trims `points` down to just the
-        // undrained tail after every drain, so points.size() alone would go stale mid-stroke.
-        if (totalPointCount < 2) return !complete;
+        // A one-point outline is drawable, so submit the DOWN immediately. This keeps a contact
+        // dot native-owned while Flutter's normal one-point/tap completion path remains intact.
+        if (totalPointCount == 0) return !complete;
         boolean changed = totalPointCount != initialPointCount;
         if (changed || complete) {
-            submit(complete, !complete && totalPointCount % CHECKPOINT_POINTS == 0);
+            submit(complete, !complete && totalPointCount / CHECKPOINT_POINTS
+                    > initialPointCount / CHECKPOINT_POINTS);
         }
         return true;
     }
@@ -566,20 +573,16 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         if (!Float.isFinite(x) || !Float.isFinite(y) || !Float.isFinite(pressure)) {
             return false;
         }
-        if (!points.isEmpty()) {
-            PerfectFreehandGeometry.Point last = points.get(points.size() - 1);
+        if (lastInputPoint != null) {
+            PerfectFreehandGeometry.Point last = lastInputPoint;
             if (last.x == x && last.y == y) return true;
         }
         // No length-based abort here: a stroke is never ended just because it ran long. The
         // incremental engine on the renderer thread only ever sees the undrained tail (see
         // drainLatest(), which trims `points` back down after every drain), so memory stays
         // bounded by drain frequency, not by capping how many points a stroke may contain.
-        if (policy != null && policy.firstPressure && points.size() == 1) {
-            PerfectFreehandGeometry.Point first = points.get(0);
-            points.set(0, new PerfectFreehandGeometry.Point(first.x, first.y,
-                    (double) pressure));
-        }
-        points.add(new PerfectFreehandGeometry.Point(x, y, (double) pressure));
+        lastInputPoint = new PerfectFreehandGeometry.Point(x, y, (double) pressure);
+        points.add(lastInputPoint);
         totalPointCount++;
         return true;
     }
@@ -697,18 +700,24 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
 
     private void abortStroke(String reason) {
         long token = activeToken;
+        long sourceTimestampUs = activeSourceTimestampUs;
         Log.w(TAG, "abortStroke: " + reason + " token=" + token);
         activePointer = -1;
         activeToken = Long.MIN_VALUE;
+        activeSourceTimestampUs = Long.MIN_VALUE;
         points.clear();
         drainedCount = 0;
         totalPointCount = 0;
+        lastInputPoint = null;
         pendingPredicted = null;
         predictor = null;
         platformPredictor = null;
         pendingSnapshot = null;
         if (token == Long.MIN_VALUE) return;
-        handoff.cancelNative(token);
+        if (handoff.cancelNative(token) != null && sourceTimestampUs != Long.MIN_VALUE) {
+            StrokeAbortedCallback callback = strokeAbortedCallback;
+            if (callback != null) callback.onAborted(generation, sourceTimestampUs);
+        }
         Snapshot snapshot = latestSnapshot;
         if (snapshot != null && snapshot.token == token) {
             clearRequested = true;
@@ -716,16 +725,16 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         }
     }
 
-    @Override public void registerStroke(Object arguments) {
+    @Override public boolean registerStroke(Object arguments) {
         Map<?, ?> state = map(arguments);
         Number requested = state == null ? null : number(state.get("generation"));
         Number source = state == null ? null : number(state.get("sourceTimestampUs"));
-        if (requested == null || source == null || requested.longValue() != generation) return;
+        if (requested == null || source == null || requested.longValue() != generation) return false;
         if (!enabled || clearRequested || pendingClear.get() != 0) {
             handoff.cancel(requested.longValue(), source.longValue());
-            return;
+            return false;
         }
-        handoff.register(requested.longValue(), source.longValue());
+        return handoff.register(requested.longValue(), source.longValue());
     }
 
     @Override public void acknowledgeStroke(Object arguments, Runnable completion) {
@@ -804,9 +813,11 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         clearRequested = false;
         latestSnapshot = null;
         activeToken = Long.MIN_VALUE;
+        activeSourceTimestampUs = Long.MIN_VALUE;
         points.clear();
         drainedCount = 0;
         totalPointCount = 0;
+        lastInputPoint = null;
     }
 
     @Override public void disable() {
@@ -819,9 +830,11 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
         frontRenderOutstanding = false;
         activePointer = -1;
         activeToken = Long.MIN_VALUE;
+        activeSourceTimestampUs = Long.MIN_VALUE;
         points.clear();
         drainedCount = 0;
         totalPointCount = 0;
+        lastInputPoint = null;
         pendingPredicted = null;
         predictor = null;
         platformPredictor = null;
@@ -874,12 +887,7 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
                         + " snapshotNull=" + (last.snapshot == null));
                 return;
             }
-            // A live checkpoint only ever needs to add what changed since the previous one (see
-            // drawCheckpointDelta); only stroke completion -- once per stroke, off the 60Hz input
-            // path -- pays for the exact, whole-outline redraw.
-            boolean success = last.snapshot.complete
-                    ? drawFullOutline(canvas, last.snapshot)
-                    : drawCheckpointDelta(canvas, last.snapshot);
+            boolean success = drawFullOutline(canvas, last.snapshot);
             multiCallbacks.add(new CallbackRecord(last.snapshot, Kind.STROKE,
                     last.generation, last.readinessEpoch, success));
         }
@@ -986,7 +994,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     private PerfectFreehandGeometry.IncrementalOutline engineFor(Snapshot snapshot) {
         if (engine == null || engineToken != snapshot.token) {
             engine = new PerfectFreehandGeometry.IncrementalOutline(snapshot.policy.width,
-                    snapshot.policy.thinning, snapshot.policy.smoothing, snapshot.policy.streamline);
+                    snapshot.policy.thinning, snapshot.policy.smoothing, snapshot.policy.streamline,
+                    snapshot.policy.firstPressure);
             engineToken = snapshot.token;
         }
         return engine;
@@ -1000,10 +1009,9 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
      * {@link #predictedPaint} (a lighter alpha than the real tail's opaque {@link #paint}) and is
      * never retained by the engine, so the next real frame's tail naturally overdraws most of it.
      * Any lighter 'shadow' pixels a direction change leaves beside the real stroke do not linger
-     * past the next {@link #CHECKPOINT_POINTS}-point checkpoint or stroke completion: the former
-     * calls {@link #drawCheckpointDelta} and the latter {@link #drawFullOutline}, and either way
-     * only the engine's committed (non-predicted) geometry reaches the multi-buffered layer, so
-     * no per-frame clear is needed here to keep the residual bounded.
+     * past the next {@link #CHECKPOINT_POINTS}-point checkpoint or stroke completion: both call
+     * {@link #drawFullOutline}, which clears the buffer and redraws only the engine's committed
+     * (non-predicted) geometry, so no per-frame clear is needed to keep the residual bounded.
      */
     private boolean drawFrontTail(Canvas canvas, Snapshot snapshot) {
         try {
@@ -1031,12 +1039,9 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
     }
 
     /**
-     * The multi-buffered stroke-completion draw: the exact full outline, from the same engine's
-     * own accumulated state -- proven equal to a from-scratch computation by
-     * {@code PerfectFreehandGeometryParityTest} -- rather than a separate recompute. Only reached
-     * for {@code snapshot.complete} (see {@link RendererCallback#onDrawMultiBufferedLayer}): a
-     * single draw at pen lift, off the 60Hz input path, so paying for the whole shape here is
-     * fine. A live checkpoint instead calls {@link #drawCheckpointDelta}.
+     * The multi-buffered (checkpoint/completion) draw: the exact full outline, from the same
+     * engine's own accumulated state -- proven equal to a from-scratch computation by
+     * {@code PerfectFreehandGeometryParityTest} -- rather than a separate recompute.
      */
     private boolean drawFullOutline(Canvas canvas, Snapshot snapshot) {
         try {
@@ -1048,59 +1053,6 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             return true;
         } catch (RuntimeException | LinkageError error) {
             postFailure("drawFullOutline threw for token=" + snapshot.token, error);
-            return false;
-        }
-    }
-
-    /**
-     * The multi-buffered per-checkpoint draw: unlike {@link #drawFullOutline}, this only clears
-     * and redraws the rectangle bounding whatever changed since the previous checkpoint --
-     * {@link PerfectFreehandGeometry.IncrementalOutline#checkpointTail()}'s fragment, unioned
-     * with the current predicted tail's bounds (defensive: the predicted tail is never itself
-     * drawn to this layer, but this keeps the region this layer clears at a checkpoint consistent
-     * with what a full redraw would have cleared there) -- padded by the stroke width and a small
-     * anti-aliasing margin. Everything outside that rectangle is left untouched via
-     * {@link Canvas#clipRect}, which is what keeps this cheap: cost is bounded by one checkpoint
-     * interval's geometry, never by the whole stroke, so this -- not {@link #drawFullOutline} --
-     * is what runs on the input path of a live stroke.
-     *
-     * <p>Correctness relies on the persistent multi-buffered layer never being cleared as a
-     * whole between checkpoints of the same stroke (only {@link #drawFullOutline}, at stroke
-     * completion, and the clear issued once a stroke's ink is fully handed off do that): each
-     * checkpoint only ever adds its own delta on top of what earlier checkpoints already drew,
-     * so the layer accumulates to exactly the same image {@link #drawFullOutline} would have
-     * produced from scratch -- proven by {@code
-     * PerfectFreehandGeometryParityTest#checkpointTailUnionMatchesFullOutlineForLongFixture}.
-     */
-    private boolean drawCheckpointDelta(Canvas canvas, Snapshot snapshot) {
-        try {
-            PerfectFreehandGeometry.IncrementalOutline current = engineFor(snapshot);
-            List<PerfectFreehandGeometry.Point> tail = current.checkpointTail();
-            PerfectFreehandGeometry.Bounds bounds = PerfectFreehandGeometry.boundsOf(tail);
-            if (snapshot.predicted != null) {
-                PerfectFreehandGeometry.Bounds predictedBounds = PerfectFreehandGeometry.boundsOf(
-                        current.predictTail(snapshot.predicted));
-                if (predictedBounds != null) {
-                    bounds = bounds == null ? predictedBounds : bounds.union(predictedBounds);
-                }
-            }
-            if (bounds == null) return true; // nothing changed since the last checkpoint.
-            bounds = bounds.padded(snapshot.policy.width + CHECKPOINT_CLEAR_MARGIN_PX);
-            canvas.save();
-            try {
-                canvas.clipRect((float) bounds.left, (float) bounds.top,
-                        (float) bounds.right, (float) bounds.bottom);
-                canvas.drawColor(0, BlendMode.CLEAR);
-                if (!tail.isEmpty()) {
-                    PerfectFreehandGeometry.buildFilledQuadraticPath(tail, scratchPath);
-                    canvas.drawPath(scratchPath, paint);
-                }
-            } finally {
-                canvas.restore();
-            }
-            return true;
-        } catch (RuntimeException | LinkageError error) {
-            postFailure("drawCheckpointDelta threw for token=" + snapshot.token, error);
             return false;
         }
     }
@@ -1120,7 +1072,8 @@ final class SharedGeometryInkOverlay implements StylusWetInkRenderer {
             // just to JIT-warm the incremental path the same way the call above warms the static one.
             PerfectFreehandGeometry.IncrementalOutline warmEngine =
                     new PerfectFreehandGeometry.IncrementalOutline(
-                            current.width, current.thinning, current.smoothing, current.streamline);
+                            current.width, current.thinning, current.smoothing, current.streamline,
+                            current.firstPressure);
             warmEngine.appendPoints(warm);
         } catch (RuntimeException | LinkageError error) {
             quarantine("prewarmGeometry threw", error);

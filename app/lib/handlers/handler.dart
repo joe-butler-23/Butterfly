@@ -104,7 +104,7 @@ class EventContext {
   final BuildContext buildContext;
   final Size viewportSize;
   final bool isShiftPressed, isAltPressed, isCtrlPressed;
-  final NativeInkStrokeIdentity? Function(PointerDownEvent event)?
+  final Future<NativeInkStrokeIdentity?> Function(PointerDownEvent event)?
   registerNativeInkStroke;
   final bool Function(
     NativeInkStrokeIdentity identity,

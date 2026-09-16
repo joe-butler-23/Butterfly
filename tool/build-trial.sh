@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build the Butterfly latencyLab release APK on minworker inside a bounded
 # systemd scope, one build at a time. Usage: tool/build-trial.sh [extra flutter args]
+# Finish Flutter tests before starting this build: both commands regenerate the
+# same plugin registrant, with different release/test plugin sets.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 lock=/tmp/butterfly-build.lock

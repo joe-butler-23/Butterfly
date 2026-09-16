@@ -69,11 +69,13 @@ final class InkHandoffCoordinator<T> {
         return evicted.token;
     }
 
-    /** A registration for an unknown key (native never started, or already aborted) is a no-op. */
-    void register(long expectedGeneration, long sourceTimestampUs) {
-        if (expectedGeneration != generation || sourceTimestampUs < 0) return;
+    /** Returns true only when this exact native stroke is still tracked. */
+    boolean register(long expectedGeneration, long sourceTimestampUs) {
+        if (expectedGeneration != generation || sourceTimestampUs < 0) return false;
         Entry<T> entry = byTimestamp.get(sourceTimestampUs);
-        if (entry != null) entry.registered = true;
+        if (entry == null) return false;
+        entry.registered = true;
+        return true;
     }
 
     /**

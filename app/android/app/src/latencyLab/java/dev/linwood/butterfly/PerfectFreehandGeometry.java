@@ -240,12 +240,17 @@ final class PerfectFreehandGeometry {
         private final double thinning;
         private final double smoothing;
         private final double streamline;
+        private final boolean firstPressure;
         private final double t;
         private final double minDistance;
 
+        // Retained so a late pressure-policy transition can replay the same single geometry path
+        // once with Flutter's actual-pressure policy. It is not a second renderer or document
+        // representation; native ink remains transient.
         private final List<Point> rawPoints = new ArrayList<>();
         private boolean settled;
         private boolean simulatePressureDecision;
+        private double pressureReference;
 
         // getStrokePoints-layer resumable state (valid once settled).
         private Point previousStrokePointPoint;
@@ -282,20 +287,17 @@ final class PerfectFreehandGeometry {
         private boolean confirmedSharpCorner;
         private int confirmedIndex;
 
-        // Rail lengths as of the last checkpointTail() call, so that call returns only what
-        // changed since the *previous* checkpoint rather than the whole stroke (see
-        // SharedGeometryInkOverlay.drawCheckpointDelta). Both start at 0, and combined with
-        // checkpointStartCapDrawn below that makes the very first call return the full (at that
-        // point still small) outline, start cap included.
-        private int checkpointLeftBoundary;
-        private int checkpointRightBoundary;
-        private boolean checkpointStartCapDrawn;
-
         IncrementalOutline(double size, double thinning, double smoothing, double streamline) {
+            this(size, thinning, smoothing, streamline, false);
+        }
+
+        IncrementalOutline(double size, double thinning, double smoothing, double streamline,
+                boolean firstPressure) {
             this.size = size;
             this.thinning = clamp(thinning, 0.0, 1.0);
             this.smoothing = clamp(smoothing, 0.0, 1.0);
             this.streamline = clamp(streamline, 0.1, 1.0);
+            this.firstPressure = firstPressure;
             this.t = 0.15 + (1.0 - this.streamline) * 0.85;
             this.minDistance = Math.pow(size * this.smoothing, 2.0);
         }
@@ -317,17 +319,32 @@ final class PerfectFreehandGeometry {
                 int consumed = 0;
                 List<Point> full = List.of();
                 for (; consumed < newPoints.size() && !settled; consumed++) {
-                    rawPoints.add(newPoints.get(consumed));
+                    addRawPoint(newPoints.get(consumed));
                     full = recomputeUnsettled();
                 }
                 if (!settled) return new TailResult(full, true);
+                int settledAt = consumed;
+                boolean pressurePolicyChanged = false;
                 for (; consumed < newPoints.size(); consumed++) {
-                    appendOnePoint(newPoints.get(consumed));
+                    pressurePolicyChanged |= addRawPoint(newPoints.get(consumed));
+                }
+                if (pressurePolicyChanged) {
+                    rebuildForPressurePolicyChange();
+                    return new TailResult(assembleFullOutline(), true);
+                }
+                for (int index = settledAt; index < newPoints.size(); index++) {
+                    appendOnePoint(newPoints.get(index));
                 }
                 return new TailResult(assembleFullOutline(), true);
             }
             int leftBoundary = leftPoints.size() - pendingLeftCount;
             int rightBoundary = rightPoints.size() - pendingRightCount;
+            boolean pressurePolicyChanged = false;
+            for (Point raw : newPoints) pressurePolicyChanged |= addRawPoint(raw);
+            if (pressurePolicyChanged) {
+                rebuildForPressurePolicyChange();
+                return new TailResult(assembleFullOutline(), true);
+            }
             boolean anyChange = false;
             for (Point raw : newPoints) {
                 if (appendOnePoint(raw)) anyChange = true;
@@ -346,6 +363,10 @@ final class PerfectFreehandGeometry {
             if (!settled || !havePending) return List.of();
             int leftSize = leftPoints.size();
             int rightSize = rightPoints.size();
+            List<Point> savedPendingLeftEntries = new ArrayList<>(leftPoints.subList(
+                    leftSize - pendingLeftCount, leftSize));
+            List<Point> savedPendingRightEntries = new ArrayList<>(rightPoints.subList(
+                    rightSize - pendingRightCount, rightSize));
             Point savedStrokePoint = previousStrokePointPoint;
             double savedRunningLength = previousStrokePointRunningLength;
             double savedPressure = previousPressure, savedConfirmedPressure = confirmedPressure;
@@ -365,8 +386,10 @@ final class PerfectFreehandGeometry {
                     ? tailSince(leftBoundary, rightBoundary)
                     : List.of();
 
-            truncate(leftPoints, leftPoints.size() - leftSize);
-            truncate(rightPoints, rightPoints.size() - rightSize);
+            truncate(leftPoints, leftPoints.size() - (leftSize - savedPendingLeft));
+            leftPoints.addAll(savedPendingLeftEntries);
+            truncate(rightPoints, rightPoints.size() - (rightSize - savedPendingRight));
+            rightPoints.addAll(savedPendingRightEntries);
             previousStrokePointPoint = savedStrokePoint;
             previousStrokePointRunningLength = savedRunningLength;
             previousPressure = savedPressure;
@@ -406,53 +429,6 @@ final class PerfectFreehandGeometry {
             return outline;
         }
 
-        /**
-         * The outline fragment appended since the previous call to this method (or since the
-         * engine's first settled point, on the very first call), padded the same way
-         * {@link #tailSince} pads a front-buffer tail so a checkpoint's redraw shares an edge
-         * with -- rather than merely touches -- whatever the persistent multi-buffered layer
-         * already holds from the previous checkpoint. Advances the recorded boundary to the
-         * rails' current confirmed length, so the next call only returns what changed since
-         * *this* call: cost is bounded by one checkpoint interval's geometry, not the whole
-         * stroke.
-         *
-         * <p>While still unsettled, this instead returns the (cheap, small-N -- see the class
-         * doc) full outline every time, matching {@link #appendPoints}'s own unsettled handling,
-         * and marks the start cap as already covered by that result.
-         *
-         * <p>The very first settled call also splices in {@link #startCap} -- never itself part
-         * of {@link #tailSince}'s result, since every later call assumes it was already drawn --
-         * in the same trailing position {@link #assembleFullOutline} uses, so that call draws
-         * exactly the shape a full-outline draw would for a stroke this short.
-         *
-         * <p>Used by {@code SharedGeometryInkOverlay}'s per-checkpoint local redraw of the
-         * multi-buffered layer ({@code drawCheckpointDelta}); the exact, stroke-completion draw
-         * still calls {@link #assembleFullOutline} directly.
-         */
-        List<Point> checkpointTail() {
-            if (!settled) {
-                checkpointLeftBoundary = 0;
-                checkpointRightBoundary = 0;
-                checkpointStartCapDrawn = true;
-                return assembleFullOutline();
-            }
-            int leftBoundary = checkpointLeftBoundary;
-            int rightBoundary = checkpointRightBoundary;
-            checkpointLeftBoundary = leftPoints.size() - pendingLeftCount;
-            checkpointRightBoundary = rightPoints.size() - pendingRightCount;
-            List<Point> tail = tailSince(leftBoundary, rightBoundary);
-            if (!checkpointStartCapDrawn) {
-                checkpointStartCapDrawn = true;
-                if (!startCap.isEmpty()) {
-                    List<Point> withCap = new ArrayList<>(tail.size() + startCap.size());
-                    withCap.addAll(tail);
-                    withCap.addAll(startCap);
-                    tail = withCap;
-                }
-            }
-            return tail;
-        }
-
         private List<Point> recomputeUnsettled() {
             boolean simulate = decideSimulatePressure(rawPoints);
             List<StrokePoint> strokePoints = getStrokePoints(
@@ -465,6 +441,28 @@ final class PerfectFreehandGeometry {
                 previousStrokePointRunningLength = last.runningLength;
             }
             return assembleFullOutline();
+        }
+
+        private boolean addRawPoint(Point raw) {
+            rawPoints.add(raw);
+            if (rawPoints.size() == 2) {
+                pressureReference = raw.pressure;
+                if (firstPressure) {
+                    Point first = rawPoints.get(0);
+                    rawPoints.set(0, new Point(first.x, first.y, raw.pressure));
+                }
+            }
+            return simulatePressureDecision && rawPoints.size() > 2
+                    && raw.pressure != pressureReference;
+        }
+
+        private void rebuildForPressurePolicyChange() {
+            List<StrokePoint> strokePoints = getStrokePoints(rawPoints,
+                    butterflyOptions(size, thinning, smoothing, streamline, false));
+            replay(strokePoints, false);
+            StrokePoint last = strokePoints.get(strokePoints.size() - 1);
+            previousStrokePointPoint = last.point;
+            previousStrokePointRunningLength = last.runningLength;
         }
 
         /**
@@ -930,57 +928,6 @@ final class PerfectFreehandGeometry {
                     previousPressure
                             + (rate - previousPressure) * (speed * RATE_OF_PRESSURE_CHANGE));
         }
-    }
-
-    /**
-     * Axis-aligned bounding box in the same coordinate space as the {@link Point}s it was
-     * computed from. Deliberately not {@link RectF}: this type exists specifically so
-     * {@link #boundsOf} can be exercised from a plain JVM unit test without an Android runtime,
-     * the same reason {@link PathOperation} exists alongside {@link Path}.
-     */
-    static final class Bounds {
-        final double left, top, right, bottom;
-
-        Bounds(double left, double top, double right, double bottom) {
-            this.left = left;
-            this.top = top;
-            this.right = right;
-            this.bottom = bottom;
-        }
-
-        Bounds union(Bounds other) {
-            return new Bounds(
-                    Math.min(left, other.left), Math.min(top, other.top),
-                    Math.max(right, other.right), Math.max(bottom, other.bottom));
-        }
-
-        /** Grown by {@code amount} on every side (a negative amount shrinks it). */
-        Bounds padded(double amount) {
-            return new Bounds(left - amount, top - amount, right + amount, bottom + amount);
-        }
-    }
-
-    /**
-     * The axis-aligned bounding box of every point in {@code points}, or {@code null} for an
-     * empty list. Pure and stateless -- used to size the local redraw rectangle for a
-     * checkpoint's multi-buffered-layer update ({@code SharedGeometryInkOverlay.drawCheckpointDelta})
-     * instead of reassembling and redrawing the whole stroke every checkpoint.
-     */
-    static Bounds boundsOf(List<Point> points) {
-        if (points.isEmpty()) {
-            return null;
-        }
-        double left = Double.POSITIVE_INFINITY;
-        double top = Double.POSITIVE_INFINITY;
-        double right = Double.NEGATIVE_INFINITY;
-        double bottom = Double.NEGATIVE_INFINITY;
-        for (Point point : points) {
-            if (point.x < left) left = point.x;
-            if (point.x > right) right = point.x;
-            if (point.y < top) top = point.y;
-            if (point.y > bottom) bottom = point.y;
-        }
-        return new Bounds(left, top, right, bottom);
     }
 
     static final class PathOperation {
